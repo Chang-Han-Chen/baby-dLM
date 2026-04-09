@@ -1,0 +1,146 @@
+\documentclass{article}
+\usepackage{iclr2026_conference,times}
+\input{math_commands.tex}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{subcaption}
+
+\title{Block Diffusion Is More Compute-Efficient Than Standard Diffusion: \\
+IsoFLOP Evidence and Curriculum Learning on TinyShakespeare}
+
+\author{Chang-Han Chen \\
+University of California, Berkeley\\
+Berkeley, CA 94720, USA \\
+\texttt{changhanc@berkeley.edu}
+}
+
+\iclrfinalcopy
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Discrete diffusion language models are promising but remain at least an order of magnitude less FLOP-efficient than autoregressive (AR) models.
+We present controlled IsoFLOP experiments on character-level TinyShakespeare comparing four diffusion objectives in both standard and block formulations.
+At a budget of $6 \times 10^{14}$ FLOPs, block diffusion (block length 4) outperforms standard diffusion by 0.05--0.16 nats, with Block MDLM achieving 1.824 vs.\ 1.981 for standard MDLM.
+A curriculum that warm-starts with AR before switching to block diffusion yields an additional 0.04--0.09 nat improvement, with a sweet spot at $p_{\mathrm{AR}} = 0.3$.
+\end{abstract}
+
+\section{Introduction}
+
+Diffusion language models (dLMs) offer flexible, non-left-to-right generation but are substantially less compute-efficient to pretrain than autoregressive (AR) models \citep{sahoo2024simple, shi2024simplified}.
+Masked diffusion (MDLM) is roughly $14\times$ less efficient than AR; uniform-noise diffusion is roughly $32\times$ less efficient \citep{nie2025scaling}.
+Block diffusion \citep{arriola2025block} interpolates between AR and diffusion by splitting the sequence into blocks denoised left-to-right with cross-block causal attention.
+Meanwhile, recent work converts pretrained AR checkpoints into diffusion models \citep{sdar2025, nbdiff2025, dream2025, llada2025}, but the optimal \emph{curriculum} remains poorly understood.
+We present two sets of experiments on TinyShakespeare \citep{tinyshakespeare}: (1) IsoFLOP comparisons of block vs.\ standard diffusion across four objectives, and (2) a curriculum study warm-starting block diffusion with AR pretraining.
+
+\section{Setup}
+
+All nine model variants share a transformer backbone with RoPE, QK-norm, ReGLU MLPs, and RMSNorm ($n_{\text{head}}{=}4$), spanning six sizes from 0.1M ($d{=}64$, 2 layers) to 3M ($d{=}256$, 4 layers).
+We study four objectives: \textbf{MDLM} (progressive unmasking), \textbf{Remasked} (re-masks low-confidence tokens at generation; identical training loss to MDLM), \textbf{Edit-1} (trains on masked + 15\%-corrupted visible tokens), and \textbf{Edit-2} (two-pass correction, $2\times$ FLOP cost).
+Each has a block counterpart (block length 4) using dual-stream attention during training.
+
+We fix a single IsoFLOP budget $C_3 = 6 \times 10^{14}$ and compute training steps as $C_3 / (C \cdot N \cdot 32768)$, where $C$ is a FLOP multiplier ($C{=}6$ for standard, $12$ for block, $24$ for block Edit-2) and 32768 tokens are processed per step.
+Learning rates were determined by a prior two-stage sweep (10$\times$ then 3$\times$ zoom); all runs use linear warmup with cosine decay.
+
+\section{Results}
+
+\textbf{Block diffusion is more FLOP-efficient.}
+Figure~\ref{fig:main}(a) shows that at equal compute, all block models outperform their standard counterparts.
+Block MDLM at 0.5M achieves validation CE 1.824, vs.\ 1.981 for standard MDLM at 1M---a 0.16-nat gap.
+This advantage holds despite the $2\times$ per-step cost of block training, which is offset by the inductive bias of left-to-right block generation.
+
+\textbf{Block models prefer smaller sizes at fixed compute.}
+Block MDLM's IsoFLOP optimum is at 0.5M versus 1M for standard MDLM (Figure~\ref{fig:main}(b)).
+Beyond 0.5M, block models get too few steps under the fixed budget and overfit.
+The ranking is: Block MDLM/Remasked (1.824) $>$ Block Edit-1 (1.860) $>$ Block Edit-2 (1.936).
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\includegraphics[width=\textwidth]{figure1_isoflop_block_vs_nonblock.png}
+\vspace{-18pt}
+\caption{Block vs.\ standard diffusion at $C_3$.}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\includegraphics[width=\textwidth]{figure2_block_model_ranking.png}
+\vspace{-18pt}
+\caption{Block model ranking; shaded = overfitting.}
+\end{subfigure}
+\vspace{-6pt}
+\caption{IsoFLOP curves at $C_3 = 6 \times 10^{14}$ FLOPs on TinyShakespeare.}
+\label{fig:main}
+\vspace{-8pt}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\includegraphics[width=\textwidth]{figure3_curriculum_sweet_spot.png}
+\vspace{-18pt}
+\caption{U-shaped curriculum effect.}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\includegraphics[width=\textwidth]{figure4_curriculum_loss_curves.png}
+\vspace{-18pt}
+\caption{AR phase (blue) $\to$ BD phase (green) vs.\ pure BD (gray).}
+\end{subfigure}
+\vspace{-6pt}
+\caption{Curriculum learning: AR warm-start for block MDLM.}
+\label{fig:curriculum}
+\vspace{-8pt}
+\end{figure}
+
+\textbf{AR pretraining helps, with sweet spot at $p_{\mathrm{AR}} = 0.3$.}
+We train AR for a fraction $p_{\mathrm{AR}}$ of total steps, then continue as block MDLM for the rest (the weight transfer is seamless since both share the same backbone).
+Table~\ref{tab:curriculum} shows that $p_{\mathrm{AR}} = 0.3$ consistently gives the lowest validation loss: $-0.088$ nats at 0.3M/1200 steps and $-0.043$ nats at 1M/4000 steps.
+The effect is U-shaped (Figure~\ref{fig:curriculum}(a)): too little AR undertrains the initialization; too much starves the diffusion phase.
+At 3M the effect vanishes, likely because the model converges within budget regardless.
+Figure~\ref{fig:curriculum}(b) shows that the AR phase provides a strong initialization and the subsequent block diffusion loss stays below the pure-BD baseline throughout.
+
+\begin{table}[t]
+\centering
+\caption{Validation CE for AR$\to$Block MDLM curriculum. Bold = best per row.}
+\label{tab:curriculum}
+\vspace{2pt}
+\small
+\begin{tabular}{lcccccl}
+\toprule
+& \multicolumn{5}{c}{1200 total steps} & \\
+\cmidrule(lr){2-6}
+Size & $p{=}0$ & $p{=}0.1$ & $p{=}0.3$ & $p{=}0.5$ & $p{=}0.7$ & $\Delta$ \\
+\midrule
+0.3M & 2.045 & 1.973 & \textbf{1.957} & 1.966 & 2.006 & $-$0.088 \\
+1M   & 1.891 & 1.871 & \textbf{1.814} & 1.839 & 1.865 & $-$0.077 \\
+\midrule
+& \multicolumn{3}{c}{4000 total steps} & & & \\
+\cmidrule(lr){2-4}
+Size & $p{=}0$ & $p{=}0.3$ & $p{=}0.5$ & & & $\Delta$ \\
+\midrule
+0.3M & 1.860 & \textbf{1.812} & 1.830 & & & $-$0.049 \\
+1M   & 1.733 & \textbf{1.690} & 1.692 & & & $-$0.043 \\
+\bottomrule
+\end{tabular}
+\vspace{-8pt}
+\end{table}
+
+\section{Discussion}
+
+Our experiments yield three actionable findings: (1)~block diffusion provides a meaningful FLOP-efficiency advantage over standard diffusion, (2)~the IsoFLOP-optimal size shifts smaller for block models due to their higher per-step cost, and (3)~a 30\% AR warm-start robustly improves block diffusion.
+Key next steps include validating at OpenWebText scale (10M--300M parameters) with multiple IsoFLOP budgets for Chinchilla-style scaling curves \citep{hoffmann2022training}, sweeping the noise-schedule clipping parameters $t_{\min}$ and $t_{\max}$ (fixed at 0.45 and 0.95 here), exploring AR$\to$block-uniform curricula motivated by the downstream advantages of uniform-noise diffusion \citep{nie2025scaling}, and adopting a warmup-stable-decay LR schedule for the curriculum transition.
+
+\subsubsection*{Acknowledgments}
+Experiments were run on a single NVIDIA A100 GPU.
+
+\bibliography{iclr2026_conference}
+\bibliographystyle{iclr2026_conference}
+
+\end{document}
