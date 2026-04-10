@@ -1,3 +1,14 @@
-torch
-pillow
-ffmpeg
+# Core
+torch>=2.1
+tiktoken
+rustbpe
+
+# Data loading (ClimbMix shards)
+pyarrow
+requests
+
+# Evaluation (GPT2-large scoring, optional)
+transformers
+
+# Testing
+pytest
