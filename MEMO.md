@@ -326,9 +326,18 @@ python3 run_lr_sweep.py --optimizer adamw --model bd3lm --size 50M --sweep-batch
 
 ### Fix: reduced BD3 micro-batch, increased grad accumulation
 
-Updated `run_phase1.sh`: all BD3-LM stages now use `batch_size=64,
-grad_accum_steps=4` (effective batch = 256, unchanged). AR warmup remains at
+We tested `batch_size=64, grad_accum_steps=4` successfully in isolation, but
+the committed `run_phase1.sh` uses the more conservative
+`batch_size=32, grad_accum_steps=8` for all BD3-LM stages. This keeps the
+effective batch at 256 while giving extra memory headroom. AR warmup remains at
 `batch_size=128, grad_accum_steps=2`.
+
+The Phase 1 script now disables in-run eval and sampling entirely:
+`eval_interval=0`, `skip_final_eval=true`, `gpt2_eval_interval=0`,
+`sample_interval=0`, `num_final_samples=0`. Instead, it logs plain train
+loss / grad norm every 10 steps. This removes the expensive end-of-run eval
+pass and keeps Phase 1 focused on fast optimization traces; BPB can be
+computed later from saved checkpoints when needed.
 
 Also added a skip guard for the AR warmup: if `ckpt_step800.pt` already exists,
 Step 1 is skipped entirely so re-runs jump straight to the BD3 stages.
@@ -352,7 +361,8 @@ Step 1 is skipped entirely so re-runs jump straight to the BD3 stages.
 
 1. Push updated `run_phase1.sh` to both VMs (`git pull`).
 2. Re-run `bash run_phase1.sh adamw` and `bash run_phase1.sh normuon` — AR
-   warmup will be skipped automatically, BD3 stages should fit at batch=64.
+   warmup will be skipped automatically, and the BD3 stages use the
+   `batch_size=32, grad_accum_steps=8` setting.
 3. Commit the resulting `.pkl` loss logs.
 
 ### Disk budget (revised)
@@ -367,7 +377,7 @@ With `--save_weights_only true` on all checkpoints (~250 MB each):
 
 | File | Change |
 |------|--------|
-| `run_phase1.sh` | BD3 stages: `batch_size` 128→64, `grad_accum_steps` 2→4; added AR warmup skip guard; `python`→`python3` |
+| `run_phase1.sh` | BD3 stages: `batch_size` 128→32, `grad_accum_steps` 2→8; disabled in-run eval/sampling; train logs every 10 steps; added AR warmup skip guard; `python`→`python3` |
 | `train.py:75-76` | Fixed `--save_weights_only` help text (all checkpoints respect flag) |
 | `.gitignore` | Removed `runs/` and `*.pkl`; kept `*.pt` |
 | `MEMO.md` | Updated `--save_weights_only` description; added this section |

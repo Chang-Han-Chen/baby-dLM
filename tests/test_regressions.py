@@ -275,6 +275,47 @@ def test_warmup_stable_holds_lr_constant(tmp_path):
 
 
 @requires_cuda_climbmix
+def test_eval_interval_zero_still_uses_train_log_interval(tmp_path):
+    """Disabling eval should not force per-step train logging."""
+    result = run_repo_cmd(
+        "train.py",
+        "--model", "mdlm",
+        "--data", "climbmix",
+        "--max_iters", "21",
+        "--warmup_iters", "1",
+        "--eval_interval", "0",
+        "--train_log_interval", "10",
+        "--batch_size", "2",
+        "--block_size", "16",
+        "--n_embd", "16",
+        "--n_head", "4",
+        "--n_layer", "1",
+        "--save_interval", "0",
+        "--num_final_samples", "0",
+        "--sample_interval", "0",
+        "--gpt2_eval_interval", "0",
+        "--gpt2_eval_samples", "0",
+        "--skip_final_eval", "true",
+        "--use_compile", "false",
+        "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+        "--loss_log_path", str(tmp_path / "loss.pkl"),
+    )
+    assert result.returncode == 0, result.stderr
+
+    logged_steps = []
+    for line in result.stdout.splitlines():
+        if not line.startswith("step ") or "grad_norm" not in line:
+            continue
+        step_str = line.split(" | ", 1)[0].split()[1]
+        logged_steps.append(int(step_str))
+
+    assert logged_steps == [0, 10, 20], (
+        "Expected train progress logs at steps 0, 10, and 20 when "
+        f"eval is disabled; got {logged_steps}"
+    )
+
+
+@requires_cuda_climbmix
 def test_block_len_validated_against_final_block_size(tmp_path):
     """block_len validation must use the block_size set by the data source,
     not the CLI default. With --data climbmix, train.py overrides block_size

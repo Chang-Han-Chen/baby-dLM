@@ -178,6 +178,9 @@ gpt2_eval_interval = (
 sample_interval = (
     eval_interval if args.sample_interval is None else args.sample_interval
 )
+progress_log_interval = max(1, train_log_interval)
+if eval_interval > 0:
+    progress_log_interval = min(progress_log_interval, eval_interval)
 
 n_embd = args.n_embd
 n_head = args.n_head
@@ -750,7 +753,7 @@ if __name__ == "__main__":
         elif (iter + 1) % 5000 == 0:
             gc.collect()
 
-        if iter % max(1, min(train_log_interval, eval_interval)) == 0 or iter == max_iters - 1:
+        if iter % progress_log_interval == 0 or iter == max_iters - 1:
             current_token_epoch = token_epochs_from_steps(iter, num_train_tokens)
             print(
                 f"step {iter} | tok_epoch {current_token_epoch:.2f} | "
@@ -799,17 +802,18 @@ if __name__ == "__main__":
         torch.save(final_ckpt, checkpoint_path)
         print(f"saved final checkpoint to {checkpoint_path}")
 
-    print("\n" + "=" * 60)
-    print(f"Generating {num_final_samples} samples")
-    print("=" * 60)
-    model.eval()
-
     samples = []
-    for i in range(num_final_samples):
-        sample_text = generate(model, prompt_len=prompt_len)
-        samples.append(sample_text)
-        print(f"\n--- Sample {i + 1} ---")
-        print(sample_text)
+    if num_final_samples > 0:
+        print("\n" + "=" * 60)
+        print(f"Generating {num_final_samples} samples")
+        print("=" * 60)
+        model.eval()
+
+        for i in range(num_final_samples):
+            sample_text = generate(model, prompt_len=prompt_len)
+            samples.append(sample_text)
+            print(f"\n--- Sample {i + 1} ---")
+            print(sample_text)
 
     with open(loss_log_path, "wb") as f:
         pickle.dump({

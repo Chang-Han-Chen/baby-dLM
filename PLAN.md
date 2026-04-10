@@ -193,6 +193,12 @@ families, using a fixed step budget rather than a FLOP budget.
 - Curricula: C0 (sweep p_AR ∈ {0.2, 0.3, 0.5, 0.8}) and C1 (geometric)
 - Total steps per run: 1000, split across stages by `flop_frac`
 - LR schedule: warmup-stable (5% linear warmup, then constant)
+- AR warmup uses `batch_size=128, grad_accum_steps=2` (effective batch 256)
+- BD3-LM stages use `batch_size=32, grad_accum_steps=8` due to memory limits
+  while preserving the same effective batch 256
+- Current Phase 1 execution disables in-run eval/sampling
+  (`eval_interval=0`, `skip_final_eval=true`, `num_final_samples=0`) and logs
+  train loss / grad norm every 10 steps
 
 This gives **10 runs** total (5 curricula × 2 optimizers).
 
@@ -213,8 +219,10 @@ C1 (5 equal stages): 200 steps each for AR → BD3(2) → BD3(4) → BD3(8) → 
 6. Decide whether to proceed to IsoFLOP scaling (§5A) or additional curricula.
 
 ### 5.3  Metrics
-- Primary: validation BPB (bits per byte) at the end of the final stage.
-- Secondary: per-stage train/val loss curves for diagnosing stage transitions.
+- Primary: validation BPB (bits per byte) from post-training evaluation of the
+  final checkpoint.
+- Secondary: train-loss traces logged every 10 steps during training.
+- Phase 1 training runs do not perform in-run val / GPT2 / sample eval.
 - Log optimizer family and calibrated LR settings in every result.
 
 ---
