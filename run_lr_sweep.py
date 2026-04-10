@@ -12,7 +12,8 @@ grad norm, selects the best stable config, and persists results.
 
 Parallel execution: Use --jobs N to run N sweep jobs concurrently on the same
 GPU.  Independent runs time-share CUDA and overlap data loading with compute.
-Auto-detection (--jobs auto) picks N based on model VRAM and 80 GB budget.
+Auto-detection (--jobs auto) picks N based on model VRAM and 80 GB budget,
+but falls back to 1 worker when compile is enabled for sweep runs.
 
 Usage:
     # Full sweep, auto-parallel:
@@ -157,9 +158,10 @@ def select_best_normuon(traces: List[SweepTrace]) -> Tuple[dict, SweepTrace]:
 # ---------------------------------------------------------------
 
 # Peak VRAM in GB per model, at batch_size=32, seq_len=2048, bf16, no compile.
-# Measured empirically on A100-80GB.  PyTorch's caching allocator causes VRAM
-# to grow well beyond steady-state during long runs (~40-50 GB for AR 50M at
-# batch=32), so estimates reflect worst-case observed peaks, not initial usage.
+# These are conservative heuristics for auto-parallelism on A100-80GB.
+# They were originally calibrated on the older, deeper ClimbMix size table and
+# may overestimate usage for the current shallower/wider definitions; that is
+# intentional until new empirical measurements are collected.
 _VRAM_ESTIMATE_GB = {
     # (model, size) -> estimated peak GB at sweep batch_size (32)
     ("ar",    "50M"):  45,
@@ -176,6 +178,9 @@ _VRAM_ESTIMATE_GB = {
 # Leave this much headroom for CUDA overhead, fragmentation, etc.
 _VRAM_HEADROOM_GB = 4
 _DEFAULT_GPU_GB = 80  # A100-80GB
+# Compile-enabled sweeps match production training, but auto-parallelism stays
+# conservative because simultaneous first-compile passes can spike VRAM sharply.
+_SWEEP_USE_COMPILE = True
 
 
 def estimate_max_parallel(
@@ -303,10 +308,8 @@ def run_single(
         optimizer=optimizer,
         adam_mult=adam_mult,
         matrix_mult=matrix_mult,
-        # Disable torch.compile for sweeps: compilation spikes VRAM to
-        # 50-80 GB even for small models, preventing parallel runs.
-        # The 200-step sweep is too short to amortize compile cost anyway.
-        use_compile=False,
+        # Match production training behavior during LR calibration.
+        use_compile=_SWEEP_USE_COMPILE,
     )
     # When a smaller sweep batch_size is requested, use grad accumulation
     # to maintain a fixed effective batch size of _SWEEP_EFFECTIVE_BATCH.
@@ -634,6 +637,7 @@ def main():
         "--jobs", type=str, default="auto",
         help="Number of parallel jobs (default: auto). "
              "Use 'auto' for VRAM-based auto-detection, "
+             "or 1 when compile-enabled sweeps are active, "
              "or an integer (e.g., '6'). Use '1' for sequential.",
     )
     parser.add_argument(
@@ -668,20 +672,29 @@ def main():
 
     # ---- Determine parallelism ----
     if args.jobs == "auto":
-        # Convert jobs to dicts for VRAM estimation
-        job_dicts = [{"model": j.model, "size": j.size} for j in jobs]
-        max_workers = estimate_max_parallel(
-            job_dicts,
-            gpu_gb=args.gpu_gb,
-            batch_size_override=args.sweep_batch_size,
-        )
-        print(f"Auto-detected: {max_workers} parallel workers "
-              f"(GPU: {args.gpu_gb}GB)")
+        if _SWEEP_USE_COMPILE:
+            max_workers = 1
+            print("Auto-detected: 1 parallel worker "
+                  "(compile-enabled sweeps use a conservative default)")
+        else:
+            # Convert jobs to dicts for VRAM estimation
+            job_dicts = [{"model": j.model, "size": j.size} for j in jobs]
+            max_workers = estimate_max_parallel(
+                job_dicts,
+                gpu_gb=args.gpu_gb,
+                batch_size_override=args.sweep_batch_size,
+            )
+            print(f"Auto-detected: {max_workers} parallel workers "
+                  f"(GPU: {args.gpu_gb}GB)")
     else:
         max_workers = int(args.jobs)
+        if _SWEEP_USE_COMPILE and max_workers > 1:
+            print("WARNING: compile-enabled sweeps with multiple workers may "
+                  "hit large first-compile VRAM spikes")
 
     print(f"\nTotal jobs: {len(jobs)}")
     print(f"Parallel workers: {max_workers}")
+    print(f"torch.compile: {'enabled' if _SWEEP_USE_COMPILE else 'disabled'}")
     if args.sweep_batch_size:
         print(f"Sweep batch_size: {args.sweep_batch_size} "
               f"(production: {ec.CLIMBMIX_BATCH_SIZE})")

@@ -26,9 +26,9 @@ We scale up from the TinyShakespeare regime to three sizes:
 
 | Label | n_embd | n_layer | n_head | Approx non-embedding params |
 |-------|--------|---------|--------|-----------------------------|
-| 50M   | 512    | 16      | 8      | 50.3M                       |
-| 98M   | 640    | 20      | 10     | 98.3M                       |
-| 170M  | 768    | 24      | 12     | 169.9M                      |
+| 50M   | 768    | 7       | 12     | 49.5M                       |
+| 98M   | 896    | 10      | 14     | 96.3M                       |
+| 170M  | 1024   | 14      | 16     | 176.2M                      |
 
 We count only non-embedding transformer parameters:
 `N = 12 * n_layer * n_embd^2`.

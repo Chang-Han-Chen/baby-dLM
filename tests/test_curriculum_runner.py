@@ -164,7 +164,7 @@ class TestParseStageStdout:
 
 class TestComputeStageSteps:
     def test_ar_stage_50m(self):
-        """AR stage: C=6, N=50.3M. Steps = floor(budget * frac / (C * N * tps))."""
+        """AR stage: C=6, N=non_embedding_params(50M). Steps follow the FLOP budget formula."""
         stage = ec.CurriculumStage("ar", None, 0.2)
         steps = compute_stage_steps(stage, "50M", 1e18)
         N = ec.non_embedding_params("50M")

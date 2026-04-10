@@ -2,6 +2,13 @@
 
 Running log of findings, changes, and decisions made while bringing up the experiment pipeline.
 
+Note: the canonical ClimbMix size definitions were later updated to
+`50M = (n_embd=768, n_layer=7, n_head=12)`,
+`98M = (n_embd=896, n_layer=10, n_head=14)`,
+`170M = (n_embd=1024, n_layer=14, n_head=16)`.
+Historical VRAM and throughput notes below that mention `50M/98M/170M` refer to
+the older deeper configurations unless explicitly stated otherwise.
+
 ---
 
 ## 2026-04-10: Environment Setup & Smoke Tests

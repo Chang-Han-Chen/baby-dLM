@@ -141,7 +141,7 @@ _skip_climbmix = pytest.mark.skipif(
 
 _CLIMBMIX_BASE_ARGS = [
     "--data", "climbmix",
-    "--n_embd", "512", "--n_layer", "16", "--n_head", "8",
+    "--n_embd", "768", "--n_layer", "7", "--n_head", "12",
     "--batch_size", "16",
     "--grad_accum_steps", "1",
     "--block_size", "2048",
@@ -504,7 +504,7 @@ class TestVRAMFit:
         extra = ["--block_len", "16"] if model == "bd3lm" else []
         args = [
             "--data", "climbmix",
-            "--n_embd", "512", "--n_layer", "16", "--n_head", "8",
+            "--n_embd", "768", "--n_layer", "7", "--n_head", "12",
             "--batch_size", "128",
             "--grad_accum_steps", "2",
             "--block_size", "2048",

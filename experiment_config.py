@@ -56,9 +56,9 @@ LEGACY_MODEL_SIZES = {
 
 # --- ClimbMix sizes (head_dim = 64 throughout) ---
 CLIMBMIX_MODEL_SIZES = {
-    "50M":  (512,  16,  8,  12 * 16 * 512**2),    #  50.3M
-    "98M":  (640,  20, 10,  12 * 20 * 640**2),     #  98.3M
-    "170M": (768,  24, 12,  12 * 24 * 768**2),     # 169.9M
+    "50M":  (768,   7, 12,  12 * 7  * 768**2),    #  49.5M
+    "98M":  (896,  10, 14,  12 * 10 * 896**2),    #  96.3M
+    "170M": (1024, 14, 16,  12 * 14 * 1024**2),   # 176.2M
 }
 
 # Combined registry — scripts can use ALL_SIZES or the subset they need.

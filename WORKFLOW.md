@@ -132,7 +132,7 @@ python run_curriculum.py --curriculum c1_geometric --size 50M --budget 1e18 --op
 
 ### Model sizes
 
-All three sizes are swept for each budget: 50M (512d, 16L), 98M (640d, 20L), 170M (768d, 24L). `run_isoflop.py` handles this automatically.
+All three sizes are swept for each budget: 50M (768d, 7L), 98M (896d, 10L), 170M (1024d, 14L). `run_isoflop.py` handles this automatically.
 
 ### Output
 

@@ -116,6 +116,13 @@ def load_checkpoint_metadata(ckpt_path: str) -> dict:
     }
 
 
+_LEGACY_CLIMBMIX_SIZE_ALIASES = {
+    (512, 16): "50M",
+    (640, 20): "98M",
+    (768, 24): "170M",
+}
+
+
 def infer_size_from_args(args: dict) -> Optional[str]:
     """Try to match checkpoint args to a known MODEL_SIZES entry."""
     n_embd = args.get("n_embd")
@@ -125,7 +132,9 @@ def infer_size_from_args(args: dict) -> Optional[str]:
     for label, (embd, layer, _, _) in ec.MODEL_SIZES.items():
         if embd == n_embd and layer == n_layer:
             return label
-    return None
+    # Backward compat for checkpoints produced before the shallower/wider
+    # ClimbMix size table was adopted.
+    return _LEGACY_CLIMBMIX_SIZE_ALIASES.get((n_embd, n_layer))
 
 
 def infer_lr_config(args: dict, meta: dict) -> dict:

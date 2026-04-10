@@ -120,25 +120,34 @@ class TestEvalResult:
 
 class TestInferSizeFromArgs:
     def test_50m(self):
-        assert infer_size_from_args({"n_embd": 512, "n_layer": 16}) == "50M"
+        assert infer_size_from_args({"n_embd": 768, "n_layer": 7}) == "50M"
 
     def test_98m(self):
-        assert infer_size_from_args({"n_embd": 640, "n_layer": 20}) == "98M"
+        assert infer_size_from_args({"n_embd": 896, "n_layer": 10}) == "98M"
 
     def test_170m(self):
-        assert infer_size_from_args({"n_embd": 768, "n_layer": 24}) == "170M"
+        assert infer_size_from_args({"n_embd": 1024, "n_layer": 14}) == "170M"
 
     def test_legacy_1m(self):
         assert infer_size_from_args({"n_embd": 128, "n_layer": 5}) == "1M"
+
+    def test_legacy_climbmix_50m(self):
+        assert infer_size_from_args({"n_embd": 512, "n_layer": 16}) == "50M"
+
+    def test_legacy_climbmix_98m(self):
+        assert infer_size_from_args({"n_embd": 640, "n_layer": 20}) == "98M"
+
+    def test_legacy_climbmix_170m(self):
+        assert infer_size_from_args({"n_embd": 768, "n_layer": 24}) == "170M"
 
     def test_unknown_returns_none(self):
         assert infer_size_from_args({"n_embd": 999, "n_layer": 99}) is None
 
     def test_missing_n_embd_returns_none(self):
-        assert infer_size_from_args({"n_layer": 16}) is None
+        assert infer_size_from_args({"n_layer": 7}) is None
 
     def test_missing_n_layer_returns_none(self):
-        assert infer_size_from_args({"n_embd": 512}) is None
+        assert infer_size_from_args({"n_embd": 768}) is None
 
     def test_empty_args_returns_none(self):
         assert infer_size_from_args({}) is None
