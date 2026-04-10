@@ -16,7 +16,7 @@ echo ""
 echo "=== Step 1: AR warmup (800 steps) ==="
 mkdir -p "${BASE}/ar_warmup"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model ar \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.2 --batch_size 128 --block_size 2048 \
@@ -40,7 +40,7 @@ echo ""
 echo "=== C0 p80: BD3(16) for 200 steps from AR step 800 ==="
 mkdir -p "${BASE}/c0_p80_bd3"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -62,7 +62,7 @@ echo ""
 echo "=== C0 p50: BD3(16) for 500 steps from AR step 500 ==="
 mkdir -p "${BASE}/c0_p50_bd3"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -84,7 +84,7 @@ echo ""
 echo "=== C0 p30: BD3(16) for 700 steps from AR step 300 ==="
 mkdir -p "${BASE}/c0_p30_bd3"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -106,7 +106,7 @@ echo ""
 echo "=== C0 p20: BD3(16) for 800 steps from AR step 200 ==="
 mkdir -p "${BASE}/c0_p20_bd3"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -132,7 +132,7 @@ echo ""
 echo "=== C1: BD3(bl=2) for 200 steps from shared AR step 200 ==="
 mkdir -p "${BASE}/c1_bd3_bl2"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -154,7 +154,7 @@ echo ""
 echo "=== C1: BD3(bl=4) for 200 steps from bl=2 checkpoint ==="
 mkdir -p "${BASE}/c1_bd3_bl4"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -176,7 +176,7 @@ echo ""
 echo "=== C1: BD3(bl=8) for 200 steps from bl=4 checkpoint ==="
 mkdir -p "${BASE}/c1_bd3_bl8"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
@@ -198,7 +198,7 @@ echo ""
 echo "=== C1: BD3(bl=16) for 200 steps from bl=8 checkpoint ==="
 mkdir -p "${BASE}/c1_bd3_bl16"
 
-python -u train.py \
+python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
   --dropout 0.1 --batch_size 128 --block_size 2048 \
