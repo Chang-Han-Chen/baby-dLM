@@ -54,6 +54,18 @@ def _resolve_bd3_attn_backend():
     return backend
 
 
+if FLEX_ATTN_AVAILABLE:
+    # Calling flex_attention directly outside torch.compile triggers an
+    # unfused dense fallback that materializes the score matrix. Compile a
+    # tiny wrapper so BD3 gets the intended sparse fused kernel path without
+    # requiring the whole model to be compiled.
+    @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+    def fused_flex_attention(q, k, v, block_mask):
+        return flex_attention(q, k, v, block_mask=block_mask)
+else:  # pragma: no cover - depends on local torch build
+    fused_flex_attention = None
+
+
 
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
@@ -102,7 +114,7 @@ class MultiHeadAttention(nn.Module):
         if FLEX_ATTN_AVAILABLE and BlockMask is not None and isinstance(attn_mask, BlockMask):
             # FlexAttention gives BD3 a sparse kernel path, but it does not
             # expose attention-probability dropout like SDPA does.
-            y = flex_attention(q, k, v, block_mask=attn_mask)
+            y = fused_flex_attention(q, k, v, attn_mask)
         else:
             y = F.scaled_dot_product_attention(
                 q,
