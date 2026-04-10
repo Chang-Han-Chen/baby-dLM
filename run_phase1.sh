@@ -12,6 +12,9 @@ echo "Output: ${BASE}/"
 # ============================================================
 # Step 1: Shared AR warmup (800 steps, checkpoints every 100)
 # ============================================================
+if [ -f "${BASE}/ar_warmup/ckpt_step800.pt" ]; then
+  echo "=== Step 1: AR warmup SKIPPED (checkpoints already exist) ==="
+else
 echo ""
 echo "=== Step 1: AR warmup (800 steps) ==="
 mkdir -p "${BASE}/ar_warmup"
@@ -31,6 +34,7 @@ python3 -u train.py \
   --checkpoint_path "${BASE}/ar_warmup/ckpt.pt" \
   --optimizer "${OPT}" \
   $(if [ "${OPT}" = "adamw" ]; then echo "--learning_rate 0.001 --min_lr 0.0001"; else echo "--learning_rate 1.0 --min_lr 0.1 --adam_mult 0.3 --matrix_mult 1.0 --normuon_weight_decay 0.2"; fi)
+fi
 
 # ============================================================
 # Step 2: C0 — BD3(16) continuations from AR checkpoints
@@ -43,8 +47,8 @@ mkdir -p "${BASE}/c0_p80_bd3"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 200 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 200 \
   --warmup_stable true --warmup_iters 10 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -65,8 +69,8 @@ mkdir -p "${BASE}/c0_p50_bd3"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 500 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 500 \
   --warmup_stable true --warmup_iters 25 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -87,8 +91,8 @@ mkdir -p "${BASE}/c0_p30_bd3"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 700 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 700 \
   --warmup_stable true --warmup_iters 35 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -109,8 +113,8 @@ mkdir -p "${BASE}/c0_p20_bd3"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 800 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 800 \
   --warmup_stable true --warmup_iters 40 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -135,8 +139,8 @@ mkdir -p "${BASE}/c1_bd3_bl2"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 200 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 200 \
   --warmup_stable true --warmup_iters 10 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -157,8 +161,8 @@ mkdir -p "${BASE}/c1_bd3_bl4"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 200 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 200 \
   --warmup_stable true --warmup_iters 10 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -179,8 +183,8 @@ mkdir -p "${BASE}/c1_bd3_bl8"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 200 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 200 \
   --warmup_stable true --warmup_iters 10 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \
@@ -201,8 +205,8 @@ mkdir -p "${BASE}/c1_bd3_bl16"
 python3 -u train.py \
   --data climbmix --model bd3lm \
   --n_embd 768 --n_layer 7 --n_head 12 \
-  --dropout 0.1 --batch_size 128 --block_size 2048 \
-  --grad_accum_steps 2 --max_iters 200 \
+  --dropout 0.1 --batch_size 64 --block_size 2048 \
+  --grad_accum_steps 4 --max_iters 200 \
   --warmup_stable true --warmup_iters 10 \
   --eval_interval 300 --eval_iters 50 \
   --train_log_interval 100 --save_interval 1000 --save_weights_only true \

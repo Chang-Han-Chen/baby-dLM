@@ -310,6 +310,70 @@ guarantees the cu126 build on driver 565.77 (CUDA ≤12.7).
 
 ---
 
+## 2026-04-10: Phase 1 Execution — BD3-LM OOM & Batch Size Fix
+
+### Problem: BD3-LM stages OOM at batch_size=128
+
+Both VMs completed the AR warmup (800 steps) successfully, but every BD3-LM
+stage in `run_phase1.sh` OOMed. BD3-LM is dual-stream, requiring roughly 2×
+the memory of AR at the same batch size. At `batch_size=128` on an A100-80GB,
+BD3-LM exceeds available VRAM.
+
+Confirmed that `batch_size=64` works for BD3-LM via:
+```
+python3 run_lr_sweep.py --optimizer adamw --model bd3lm --size 50M --sweep-batch-size 64
+```
+
+### Fix: reduced BD3 micro-batch, increased grad accumulation
+
+Updated `run_phase1.sh`: all BD3-LM stages now use `batch_size=64,
+grad_accum_steps=4` (effective batch = 256, unchanged). AR warmup remains at
+`batch_size=128, grad_accum_steps=2`.
+
+Also added a skip guard for the AR warmup: if `ckpt_step800.pt` already exists,
+Step 1 is skipped entirely so re-runs jump straight to the BD3 stages.
+
+### Other fixes in this session
+
+- `run_phase1.sh`: `python` → `python3` (the VMs don't have `python` on PATH).
+- `train.py`: fixed misleading `--save_weights_only` help text — all checkpoints
+  (including final) respect this flag, not just step-numbered ones.
+- `.gitignore`: removed `runs/` and `*.pkl` so loss logs can be committed;
+  kept `*.pt` to block large checkpoint files.
+
+### Current VM status
+
+| VM | Optimizer | AR warmup | BD3 stages | Notes |
+|----|-----------|-----------|------------|-------|
+| C.34527378 | adamw | Done (800 steps) | All failed (OOM at batch=128) | loss.pkl committed; needs re-run with fixed script |
+| C.34534168 | normuon | Done (800 steps) | c0_p80 failed (OOM), rest never started | No loss.pkl produced; needs re-run with fixed script |
+
+### Next steps
+
+1. Push updated `run_phase1.sh` to both VMs (`git pull`).
+2. Re-run `bash run_phase1.sh adamw` and `bash run_phase1.sh normuon` — AR
+   warmup will be skipped automatically, BD3 stages should fit at batch=64.
+3. Commit the resulting `.pkl` loss logs.
+
+### Disk budget (revised)
+
+With `--save_weights_only true` on all checkpoints (~250 MB each):
+- AR warmup: 4 step checkpoints + 1 final = 5 × 250 MB = 1.25 GB
+- C0 (4 runs): 4 × 250 MB = 1.0 GB
+- C1 (4 stages): 4 × 250 MB = 1.0 GB
+- **Total per optimizer: ~3.25 GB** (~6.5 GB for both)
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `run_phase1.sh` | BD3 stages: `batch_size` 128→64, `grad_accum_steps` 2→4; added AR warmup skip guard; `python`→`python3` |
+| `train.py:75-76` | Fixed `--save_weights_only` help text (all checkpoints respect flag) |
+| `.gitignore` | Removed `runs/` and `*.pkl`; kept `*.pt` |
+| `MEMO.md` | Updated `--save_weights_only` description; added this section |
+
+---
+
 ## Files Changed
 
 | File | Change |
