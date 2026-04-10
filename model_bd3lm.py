@@ -167,7 +167,7 @@ def make_eval_batch(x0, cfg, fixed_t_step=None, **kwargs):
     return _make_block_noisy_batch(x0, cfg, fixed_t_step=fixed_t_step)
 
 
-# Legacy: used by tiny data path and tests
+# Legacy helper kept for older tests/utilities
 def get_batch(split, cfg):
     return _get_block_batch(split, cfg)
 

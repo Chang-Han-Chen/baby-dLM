@@ -41,10 +41,10 @@ def is_block_model(model):
 # embedding table and the LM head.
 #
 # Head dim is always 64 for the ClimbMix sizes (50M, 98M, 170M).
-# Legacy TinyShakespeare sizes keep n_head=4 (variable head dim).
+# Smaller legacy sizes keep n_head=4 (variable head dim).
 # ---------------------------------------------------------------
 
-# --- Legacy TinyShakespeare sizes (kept for backward compat) ---
+# --- Smaller legacy sizes (kept for backward compat) ---
 LEGACY_MODEL_SIZES = {
     "0.1M":  (64,   2,  4,  12 * 2  * 64**2),    #  ~0.1M
     "0.3M":  (96,   3,  4,  12 * 3  * 96**2),     #  ~0.3M
@@ -77,7 +77,7 @@ ISOFLOP_BLOCK_LEN = 16  # plan §3 uses block_len=16 as the standard target
 # FLOP accounting
 # ---------------------------------------------------------------
 
-# Legacy (TinyShakespeare regime)
+# Smaller legacy-size defaults
 LEGACY_ISOFLOP_BATCH_SIZE = 128
 LEGACY_ISOFLOP_BLOCK_SIZE = 256
 
@@ -534,9 +534,9 @@ def build_command(
     """
     Build a train.py command line.
 
-    Automatically selects ClimbMix defaults (data="climbmix",
-    block_size=2048, batch_size=128, grad_accum_steps=2) for ClimbMix
-    model sizes, and legacy defaults for TinyShakespeare sizes.
+    Always trains on ClimbMix data. ClimbMix defaults are used for the
+    canonical 50M/98M/170M sizes; smaller legacy sizes keep their prior
+    batch/accum defaults unless explicitly overridden.
 
     For optimizer="normuon", adam_mult and matrix_mult default to the
     calibrated values from get_optimal_normuon() if available, falling
@@ -544,16 +544,18 @@ def build_command(
     """
     n_embd, n_layer, n_head, _ = MODEL_SIZES[size]
 
-    is_climbmix = size in CLIMBMIX_MODEL_SIZES
-
     if data is None:
-        data = "climbmix" if is_climbmix else "tiny"
+        data = "climbmix"
     if batch_size is None:
-        batch_size = CLIMBMIX_BATCH_SIZE if is_climbmix else LEGACY_ISOFLOP_BATCH_SIZE
+        batch_size = (
+            CLIMBMIX_BATCH_SIZE
+            if size in CLIMBMIX_MODEL_SIZES
+            else LEGACY_ISOFLOP_BATCH_SIZE
+        )
     if block_size is None:
-        block_size = CLIMBMIX_BLOCK_SIZE if is_climbmix else LEGACY_ISOFLOP_BLOCK_SIZE
+        block_size = CLIMBMIX_BLOCK_SIZE
     if grad_accum_steps is None:
-        grad_accum_steps = CLIMBMIX_GRAD_ACCUM if is_climbmix else 1
+        grad_accum_steps = CLIMBMIX_GRAD_ACCUM if size in CLIMBMIX_MODEL_SIZES else 1
 
     # Warmup: default to 5% of max_iters (plan §4/§5 policy), min 1.
     # Legacy default of 100 is preserved when warmup_iters is passed explicitly.

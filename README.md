@@ -14,7 +14,7 @@ Each variant shares the same transformer backbone (RoPE, QK-norm, ReGLU MLP, RMS
 
 ## Data
 
-Currently uses TinyShakespeare (`data.txt`, character-level) for fast iteration. `prepare.py` provides the data pipeline for scaling to ClimbMix (BPE tokenized, Hugging Face parquet shards).
+All training uses ClimbMix (BPE tokenized Hugging Face parquet shards). `prepare.py` downloads shards and trains the tokenizer into repo-local `data_cache/`.
 
 ```bash
 python prepare.py                  # download 10 shards + train tokenizer
@@ -32,14 +32,6 @@ model_MDLM.py            Masked diffusion model
 model_bd3lm.py           Block diffusion model (BD3-LM)
 experiment_config.py     Shared config (sizes, LRs, FLOP multipliers)
 prepare.py               ClimbMix data download + BPE tokenizer training
-data.txt                 TinyShakespeare dataset (legacy)
 reproduce.ipynb          Generates data and figures
 tests/                   Test suite
-```
-
-## Reproduce (TinyShakespeare)
-
-```bash
-pip install torch matplotlib
-jupyter notebook reproduce.ipynb  # Run All — takes ~2h on A100
 ```

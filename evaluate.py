@@ -314,7 +314,7 @@ def generate_samples(
         tokenizer = Tokenizer.from_directory()
         decode = tokenizer.decode
     else:
-        # Legacy tiny data: try to load stoi/itos from checkpoint
+        # Legacy non-ClimbMix checkpoints: try to load stoi/itos from checkpoint
         import torch as _torch
         ckpt = _torch.load(args.get("checkpoint_path", ""), map_location="cpu")
         itos = ckpt.get("itos", {})

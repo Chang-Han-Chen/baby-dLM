@@ -136,33 +136,9 @@ _skip_climbmix = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------
-# Common args for short runs — use 'tiny' data (no download needed)
+# Common args for short ClimbMix runs (50M architecture)
 # ---------------------------------------------------------------
 
-# These test CUDA correctness of the training code, NOT ClimbMix data.
-# 'tiny' mode uses data.txt (char-level Shakespeare, ~10KB, always in repo).
-_BASE_ARGS = [
-    "--data", "tiny",
-    "--n_embd", "256", "--n_layer", "6", "--n_head", "4",
-    "--batch_size", "16",
-    "--grad_accum_steps", "1",
-    "--block_size", "256",
-    "--max_iters", "30",
-    "--eval_interval", "10",
-    "--eval_iters", "2",
-    "--warmup_iters", "5",
-    "--save_interval", "0",
-    "--num_final_samples", "0",
-    "--gpt2_eval_interval", "0",
-    "--gpt2_eval_samples", "0",
-    "--sample_interval", "0",
-    "--skip_final_eval", "false",
-    "--skip_final_checkpoint", "true",
-    "--warmup_stable", "true",
-    "--use_compile", "false",  # torch.compile tested separately
-]
-
-# ClimbMix-specific base args (50M architecture, full seq_len=2048)
 _CLIMBMIX_BASE_ARGS = [
     "--data", "climbmix",
     "--n_embd", "512", "--n_layer", "16", "--n_head", "8",
@@ -183,12 +159,14 @@ _CLIMBMIX_BASE_ARGS = [
     "--warmup_stable", "true",
     "--use_compile", "false",
 ]
+_BASE_ARGS = _CLIMBMIX_BASE_ARGS
 
 
 # ===============================================================
 # Test 1: Basic CUDA training for all 3 model families x AdamW
 # ===============================================================
 
+@_skip_climbmix
 class TestCUDATraining:
     """Verify that each model family trains on CUDA without errors."""
 
@@ -237,6 +215,7 @@ class TestCUDATraining:
 # Test 2: NorMuon optimizer on CUDA
 # ===============================================================
 
+@_skip_climbmix
 class TestCUDANorMuon:
     """Verify the grouped NorMuon optimizer works on CUDA."""
 
@@ -291,6 +270,7 @@ class TestCUDANorMuon:
 # Test 3: torch.compile works on CUDA
 # ===============================================================
 
+@_skip_climbmix
 class TestTorchCompile:
     """Verify torch.compile doesn't break any model family."""
 
@@ -318,6 +298,7 @@ class TestTorchCompile:
 # Test 4: Checkpoint save + resume (weights-only warm start)
 # ===============================================================
 
+@_skip_climbmix
 class TestCheckpointResume:
     """Verify checkpointing and warm-start resume on CUDA."""
 
@@ -459,6 +440,7 @@ class TestClimbMixData:
 # Test 6: BD3-LM with different block_lens
 # ===============================================================
 
+@_skip_climbmix
 class TestBD3BlockLens:
     """Verify BD3-LM works with the block_lens used in curricula."""
 
@@ -485,6 +467,7 @@ class TestBD3BlockLens:
 # Test 7: bfloat16 autocast works (used by real training)
 # ===============================================================
 
+@_skip_climbmix
 class TestBFloat16:
     """Verify bfloat16 autocast works for all model families."""
 
@@ -555,6 +538,7 @@ class TestVRAMFit:
 # Test 8b: Gradient accumulation produces valid training
 # ===============================================================
 
+@_skip_climbmix
 class TestGradAccum:
     """Verify gradient accumulation runs correctly on CUDA."""
 
@@ -655,6 +639,7 @@ class TestSweepInfra:
 # Test 10: Eval pipeline works on a CUDA checkpoint
 # ===============================================================
 
+@_skip_climbmix
 class TestEvalPipeline:
     """Verify evaluate.py can load and evaluate a CUDA checkpoint."""
 
@@ -694,6 +679,7 @@ class TestEvalPipeline:
 # Test 11: Generation produces valid output on CUDA
 # ===============================================================
 
+@_skip_climbmix
 class TestCUDAGeneration:
     """Verify sample generation works on CUDA for all families."""
 

@@ -46,7 +46,7 @@ def make_eval_batch(x0, cfg, fixed_t_step=None, **kwargs):
     return _apply_masking(x0, cfg, fixed_t_step=fixed_t_step)
 
 
-# Legacy: used by tiny data path and tests
+# Legacy helper kept for older tests/utilities
 def get_batch(split, cfg):
     data_split = cfg["train_data"] if split == "train" else cfg["val_data"]
     B, L = cfg["batch_size"], cfg["block_size"]

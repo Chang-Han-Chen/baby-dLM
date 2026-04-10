@@ -191,7 +191,7 @@ def make_eval_batch(x0, cfg, **kwargs):
     return x0, x0, None
 
 
-# Legacy: used by tiny data path and tests
+# Legacy helper kept for older tests/utilities
 def get_batch(split, cfg):
     data_split = cfg["train_data"] if split == "train" else cfg["val_data"]
     B, L = cfg["batch_size"], cfg["block_size"]

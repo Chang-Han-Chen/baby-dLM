@@ -37,9 +37,9 @@ parser.add_argument(
     help="Which model variant to train",
 )
 parser.add_argument(
-    "--data", type=str, default="tiny",
-    choices=["tiny", "climbmix"],
-    help="Data source: 'tiny' (data.txt, char-level) or 'climbmix' (BPE, HuggingFace)",
+    "--data", type=str, default="climbmix",
+    choices=["climbmix"],
+    help="Data source: 'climbmix' (BPE, HuggingFace parquet shards)",
 )
 
 # Training
@@ -109,7 +109,6 @@ parser.add_argument(
 )
 
 # Data / misc
-parser.add_argument("--train_split_ratio", type=float, default=0.9)
 parser.add_argument("--seed", type=int, default=1337)
 parser.add_argument("--checkpoint_path", type=str, default=None,
                     help="Defaults to ckpt_{model}.pt")
@@ -193,9 +192,6 @@ model_make_batch = model_module.make_batch
 model_make_eval_batch = model_module.make_eval_batch
 model_compute_loss = model_module.compute_loss
 model_compute_eval_loss = model_module.compute_eval_loss
-# Legacy interface (used by tiny data path)
-model_get_batch = model_module.get_batch
-model_get_eval_batch = getattr(model_module, "get_eval_batch", None)
 
 device = (
     "cuda"
@@ -259,75 +255,41 @@ def print_run_info(model):
 # Data
 # ---------------------------------------------------------------------
 
-# Both data sources expose the same interface:
+# Data source interface:
 #   vocab_size, mask_token_id, block_size (possibly overridden)
 #   get_data_batch(split) -> (B, block_size) tensor of clean tokens on device
 #   decode(list_of_ids) -> str
 #   num_train_tokens -> int or None
 
-if data_source == "climbmix":
-    if device != "cuda":
-        raise RuntimeError(
-            "--data climbmix requires CUDA (the dataloader uses pinned memory "
-            "and GPU buffers). Use --data tiny for CPU/MPS debugging."
-        )
+if device != "cuda":
+    raise RuntimeError(
+        "ClimbMix training requires CUDA (the dataloader uses pinned memory "
+        "and GPU buffers)."
+    )
 
-    from prepare import Tokenizer, make_dataloader, MAX_SEQ_LEN
+from prepare import Tokenizer, make_dataloader, MAX_SEQ_LEN
 
-    tokenizer = Tokenizer.from_directory()
-    vocab_size = tokenizer.get_vocab_size()
-    mask_token_id = tokenizer.enc.encode_single_token("<|reserved_1|>")
-    block_size = MAX_SEQ_LEN  # 2048 — override CLI default
-    args.block_size = block_size
+tokenizer = Tokenizer.from_directory()
+vocab_size = tokenizer.get_vocab_size()
+mask_token_id = tokenizer.mask_token_id
+block_size = MAX_SEQ_LEN  # 2048 — fixed ClimbMix context length
+args.block_size = block_size
 
-    _train_loader = make_dataloader(tokenizer, batch_size, block_size, "train")
-    _val_loader = make_dataloader(tokenizer, batch_size, block_size, "val")
+_train_loader = make_dataloader(tokenizer, batch_size, block_size, "train")
+_val_loader = make_dataloader(tokenizer, batch_size, block_size, "val")
 
-    def get_data_batch(split):
-        loader = _train_loader if split == "train" else _val_loader
-        inputs, _targets, _epoch = next(loader)
-        return inputs  # (B, block_size) on CUDA
+def get_data_batch(split):
+    loader = _train_loader if split == "train" else _val_loader
+    inputs, _targets, _epoch = next(loader)
+    return inputs  # (B, block_size) on CUDA
 
-    def decode(ids):
-        return tokenizer.decode(ids)
+def decode(ids):
+    return tokenizer.decode(ids)
 
-    num_train_tokens = None  # unknown for streaming shards
+num_train_tokens = None  # unknown for streaming shards
 
-    print(f"Data: ClimbMix (vocab_size={vocab_size}, block_size={block_size}, "
-          f"mask_token_id={mask_token_id})")
-
-else:  # tiny
-    with open("data.txt", "r", encoding="utf-8") as f:
-        text = f.read()
-
-    chars = sorted(list(set(text)))
-    chars = ["_"] + chars  # "_" is MASK
-    vocab_size = len(chars)
-
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    itos = {i: ch for i, ch in enumerate(chars)}
-
-    mask_token_id = stoi["_"]
-
-    def encode(s):
-        return [stoi[ch] for ch in s]
-
-    def decode(ids):
-        return "".join([itos[i] for i in ids])
-
-    data = torch.tensor(encode(text), dtype=torch.long)
-    n = int(args.train_split_ratio * len(data))
-    train_data = data[:n]
-    val_data = data[n:]
-    num_train_tokens = len(train_data)
-
-    def get_data_batch(split):
-        data_split = train_data if split == "train" else val_data
-        idx = torch.randint(len(data_split) - block_size, (batch_size,))
-        return torch.stack([data_split[i : i + block_size] for i in idx]).to(device)
-
-    print(f"Data: TinyShakespeare (vocab_size={vocab_size}, "
-          f"train_tokens={num_train_tokens:,})")
+print(f"Data: ClimbMix (vocab_size={vocab_size}, block_size={block_size}, "
+      f"mask_token_id={mask_token_id})")
 
 
 # ---------------------------------------------------------------------
@@ -527,10 +489,6 @@ cfg = {
     "device": device,
     "survival_prob_tensor": survival_prob_tensor,
 }
-# Legacy: only populated for tiny data path (used by old get_batch functions)
-if data_source == "tiny":
-    cfg["train_data"] = train_data
-    cfg["val_data"] = val_data
 
 
 # ---------------------------------------------------------------------
@@ -727,9 +685,6 @@ if __name__ == "__main__":
             }
             if normuon_lrs is not None:
                 ckpt["normuon_lrs"] = normuon_lrs
-            if data_source == "tiny":
-                ckpt["stoi"] = stoi
-                ckpt["itos"] = itos
             torch.save(ckpt, checkpoint_path)
             print(f"saved checkpoint to {checkpoint_path} at step {iter}")
 
@@ -778,9 +733,6 @@ if __name__ == "__main__":
         }
         if normuon_lrs is not None:
             final_ckpt["normuon_lrs"] = normuon_lrs
-        if data_source == "tiny":
-            final_ckpt["stoi"] = stoi
-            final_ckpt["itos"] = itos
         torch.save(final_ckpt, checkpoint_path)
         print(f"saved final checkpoint to {checkpoint_path}")
 
