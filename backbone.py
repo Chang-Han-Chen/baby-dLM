@@ -54,6 +54,41 @@ def _resolve_bd3_attn_backend():
     return backend
 
 
+def _flex_kernel_options():
+    """
+    Conservative kernel settings for BD3 FlexAttention.
+
+    The default Triton autotuner can be brittle on long-sequence backward
+    passes. We bias toward a fixed, known-good backward tile on A100-class
+    hardware while still allowing an env override for experimentation.
+    """
+    preset = os.getenv("BABYDLM_FLEX_KERNEL_PRESET", "fixed").strip().lower()
+    if preset not in {"fixed", "auto"}:
+        raise ValueError(
+            "BABYDLM_FLEX_KERNEL_PRESET must be one of: fixed, auto"
+        )
+
+    opts = {
+        "BACKEND": "TRITON",
+        # Every BD3 row can always attend to at least one token.
+        "ROWS_GUARANTEED_SAFE": True,
+    }
+    if preset == "fixed":
+        opts.update(
+            {
+                # Match the best backward candidate from the A100 autotune log
+                # to avoid the broader search path during training.
+                "bwd_BLOCK_M1": 32,
+                "bwd_BLOCK_M2": 64,
+                "bwd_BLOCK_N1": 64,
+                "bwd_BLOCK_N2": 32,
+                "bwd_num_stages": 1,
+                "bwd_num_warps": 4,
+            }
+        )
+    return opts
+
+
 if FLEX_ATTN_AVAILABLE:
     # Calling flex_attention directly outside torch.compile triggers an
     # unfused dense fallback that materializes the score matrix. Compile a
@@ -61,7 +96,13 @@ if FLEX_ATTN_AVAILABLE:
     # requiring the whole model to be compiled.
     @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
     def fused_flex_attention(q, k, v, block_mask):
-        return flex_attention(q, k, v, block_mask=block_mask)
+        return flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            kernel_options=_flex_kernel_options(),
+        )
 else:  # pragma: no cover - depends on local torch build
     fused_flex_attention = None
 
