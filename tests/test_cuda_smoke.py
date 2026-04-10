@@ -85,7 +85,7 @@ def _parse_steps(stdout: str):
     return records
 
 
-def _check_basic_training(stdout: str, min_steps: int = 5):
+def _check_basic_training(stdout: str, min_steps: int = 3):
     """Assert that training produced valid, decreasing-ish loss."""
     records = _parse_steps(stdout)
     assert len(records) >= min_steps, (

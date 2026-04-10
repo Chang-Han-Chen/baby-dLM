@@ -688,7 +688,7 @@ if __name__ == "__main__":
             torch.save(ckpt, checkpoint_path)
             print(f"saved checkpoint to {checkpoint_path} at step {iter}")
 
-        if iter % 100 == 0 or iter == max_iters - 1:
+        if iter % min(100, eval_interval) == 0 or iter == max_iters - 1:
             current_token_epoch = token_epochs_from_steps(iter, num_train_tokens)
             print(
                 f"step {iter} | tok_epoch {current_token_epoch:.2f} | "
