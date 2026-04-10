@@ -530,6 +530,7 @@ def build_command(
     adam_mult=None,
     matrix_mult=None,
     normuon_weight_decay=0.2,
+    use_compile=True,
 ):
     """
     Build a train.py command line.
@@ -630,6 +631,7 @@ def build_command(
     cmd.extend(["--warmup_stable", "true" if warmup_stable else "false"])
     cmd.extend(["--skip_final_eval", "true" if skip_final_eval else "false"])
     cmd.extend(["--skip_final_checkpoint", "true" if skip_final_checkpoint else "false"])
+    cmd.extend(["--use_compile", "true" if use_compile else "false"])
 
     cmd.extend(["--optimizer", optimizer])
     if optimizer == "normuon":

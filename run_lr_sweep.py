@@ -156,20 +156,21 @@ def select_best_normuon(traces: List[SweepTrace]) -> Tuple[dict, SweepTrace]:
 # VRAM estimation for auto-parallelism
 # ---------------------------------------------------------------
 
-# Approximate peak VRAM in GB per model, at batch_size=128, seq_len=2048, bf16.
-# Includes model weights + optimizer states + activations.
-# BD3-LM uses dual-stream (2× seq_len effective), so ~2× activation cost.
+# Peak VRAM in GB per model, at batch_size=32, seq_len=2048, bf16, no compile.
+# Measured empirically on A100-80GB.  PyTorch's caching allocator causes VRAM
+# to grow well beyond steady-state during long runs (~40-50 GB for AR 50M at
+# batch=32), so estimates reflect worst-case observed peaks, not initial usage.
 _VRAM_ESTIMATE_GB = {
-    # (model, size) -> estimated GB
-    ("ar",    "50M"):  6,
-    ("ar",    "98M"):  10,
-    ("ar",    "170M"): 16,
-    ("mdlm",  "50M"):  6,
-    ("mdlm",  "98M"):  10,
-    ("mdlm",  "170M"): 16,
-    ("bd3lm", "50M"):  10,
-    ("bd3lm", "98M"):  16,
-    ("bd3lm", "170M"): 28,
+    # (model, size) -> estimated peak GB at sweep batch_size (32)
+    ("ar",    "50M"):  45,
+    ("ar",    "98M"):  55,
+    ("ar",    "170M"): 75,
+    ("mdlm",  "50M"):  45,
+    ("mdlm",  "98M"):  55,
+    ("mdlm",  "170M"): 75,
+    ("bd3lm", "50M"):  55,
+    ("bd3lm", "98M"):  65,
+    ("bd3lm", "170M"): 80,
 }
 
 # Leave this much headroom for CUDA overhead, fragmentation, etc.
@@ -197,12 +198,8 @@ def estimate_max_parallel(
         _VRAM_ESTIMATE_GB.get((j["model"], j["size"]), 16)
         for j in jobs
     )
-    # Scale VRAM if using a smaller sweep batch_size.
-    # Model weights + optimizer are fixed; activations (~60-70% of total) scale
-    # linearly.  Use a conservative 0.5 weight + 0.5 * scale factor.
-    if batch_size_override is not None and batch_size_override < ec.CLIMBMIX_BATCH_SIZE:
-        ratio = batch_size_override / ec.CLIMBMIX_BATCH_SIZE
-        max_vram = max_vram * (0.35 + 0.65 * ratio)
+    # Note: VRAM estimates already reflect sweep batch_size (32), not
+    # production batch_size.  No scaling needed.
 
     usable = gpu_gb - _VRAM_HEADROOM_GB
     n = max(1, int(usable / max_vram))
@@ -212,6 +209,11 @@ def estimate_max_parallel(
 # ---------------------------------------------------------------
 # Early-abort: detect divergence in real time
 # ---------------------------------------------------------------
+
+# Effective batch size for LR sweeps.  When --sweep-batch-size reduces the
+# micro-batch, grad_accum is increased to keep this constant so that LR
+# calibration is representative of production training.
+_SWEEP_EFFECTIVE_BATCH = 256
 
 _LOSS_ABORT_THRESHOLD = 100.0   # if loss exceeds this, LR is too high
 _GRAD_ABORT_THRESHOLD = 1e4     # grad norm explosion
@@ -301,13 +303,18 @@ def run_single(
         optimizer=optimizer,
         adam_mult=adam_mult,
         matrix_mult=matrix_mult,
-        # LR sweep runs a single micro-batch per step (no accumulation).
-        # The sweep selects LR by relative ranking, which is robust to
-        # batch size; skipping accum halves wall-time per sweep run.
-        grad_accum_steps=1,
+        # Disable torch.compile for sweeps: compilation spikes VRAM to
+        # 50-80 GB even for small models, preventing parallel runs.
+        # The 2000-step sweep is too short to amortize compile cost anyway.
+        use_compile=False,
     )
+    # When a smaller sweep batch_size is requested, use grad accumulation
+    # to maintain a fixed effective batch size of _SWEEP_EFFECTIVE_BATCH.
     if batch_size is not None:
         build_kwargs["batch_size"] = batch_size
+        build_kwargs["grad_accum_steps"] = _SWEEP_EFFECTIVE_BATCH // batch_size
+    else:
+        build_kwargs["grad_accum_steps"] = _SWEEP_EFFECTIVE_BATCH // ec.CLIMBMIX_BATCH_SIZE
 
     cmd = ec.build_command(**build_kwargs)
 
