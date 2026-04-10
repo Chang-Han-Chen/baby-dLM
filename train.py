@@ -43,10 +43,14 @@ parser.add_argument(
 )
 
 # Training
-parser.add_argument("--batch_size", type=int, default=256)
+parser.add_argument("--batch_size", type=int, default=128)
 parser.add_argument("--block_size", type=int, default=256)
 parser.add_argument("--block_len", type=int, default=None,
                     help="Diffusion block length for block models (default: block_size)")
+parser.add_argument("--grad_accum_steps", type=int, default=1,
+                    help="Gradient accumulation steps.  Effective batch = "
+                         "batch_size * grad_accum_steps.  Use 2 for effective "
+                         "bs=256 at micro-batch=128.")
 parser.add_argument("--max_iters", type=int, default=4000)
 parser.add_argument("--eval_interval", type=int, default=300)
 parser.add_argument("--warmup_iters", type=int, default=100)
@@ -148,6 +152,7 @@ min_lr = args.min_lr
 eval_iters = args.eval_iters
 save_interval = args.save_interval
 grad_clip = args.grad_clip
+grad_accum_steps = args.grad_accum_steps
 gpt2_eval_interval = (
     eval_interval if args.gpt2_eval_interval is None else args.gpt2_eval_interval
 )
@@ -218,12 +223,13 @@ def count_parameters(model):
 def token_epochs_from_steps(num_steps, ntok):
     if ntok is None or ntok == 0:
         return float("nan")
-    return (num_steps * batch_size * block_size) / ntok
+    return (num_steps * batch_size * block_size * grad_accum_steps) / ntok
 
 
 def print_run_info(model):
     n_params = count_parameters(model)
-    train_tokens_per_step = batch_size * block_size
+    micro_tokens = batch_size * block_size
+    effective_tokens_per_step = micro_tokens * grad_accum_steps
 
     print("=" * 80)
     print("Training config")
@@ -234,7 +240,11 @@ def print_run_info(model):
     print(f"vocab_size: {vocab_size}")
     if num_train_tokens is not None:
         print(f"train_tokens: {num_train_tokens:,}")
-    print(f"tokens_per_step: {train_tokens_per_step:,}")
+    if grad_accum_steps > 1:
+        print(f"micro_batch_size: {batch_size}")
+        print(f"effective_batch_size: {batch_size * grad_accum_steps}")
+        print(f"grad_accum_steps: {grad_accum_steps}")
+    print(f"tokens_per_step: {effective_tokens_per_step:,}")
     print(f"model_parameters: {n_params:,} ({n_params / 1e6:.3f}M)")
     if num_train_tokens is not None:
         te_step = token_epochs_from_steps(1, num_train_tokens)
@@ -676,14 +686,22 @@ if __name__ == "__main__":
                 print(generate(model, prompt_len=prompt_len))
             model.train()
 
-        x0 = get_data_batch("train")
-        batch = model_make_batch(x0, cfg)
-
-        with autocast_ctx():
-            loss = model_compute_loss(compiled_model, batch, cfg)
-
+        # --- Gradient accumulation loop ---
+        # Each optimizer step accumulates grad_accum_steps micro-batches.
+        # Loss is scaled by 1/grad_accum_steps so that the averaged gradient
+        # is independent of the accumulation count.
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        accum_loss = 0.0
+        for _micro in range(grad_accum_steps):
+            x0 = get_data_batch("train")
+            batch = model_make_batch(x0, cfg)
+            with autocast_ctx():
+                micro_loss = model_compute_loss(compiled_model, batch, cfg)
+                scaled_loss = micro_loss / grad_accum_steps
+            scaled_loss.backward()
+            accum_loss += micro_loss.item()
+        loss_val = accum_loss / grad_accum_steps  # average for logging
+
         if optimizer_family == "normuon":
             # Muon's orthogonalization handles gradient scaling;
             # compute grad norm for logging but don't clip.
@@ -701,7 +719,7 @@ if __name__ == "__main__":
                 "iter": iter,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "loss": loss.item(),
+                "loss": loss_val,
                 "args": vars(args),
                 "vocab_size": vocab_size,
                 "mask_token_id": mask_token_id,
@@ -719,7 +737,7 @@ if __name__ == "__main__":
             current_token_epoch = token_epochs_from_steps(iter, num_train_tokens)
             print(
                 f"step {iter} | tok_epoch {current_token_epoch:.2f} | "
-                f"loss {loss.item():.4f} | grad_norm {grad_norm:.4f} | lr {lr:.6f}"
+                f"loss {loss_val:.4f} | grad_norm {grad_norm:.4f} | lr {lr:.6f}"
             )
 
     # --- Forced final eval (avoids stale metrics when max_iters % eval_interval != 0) ---
@@ -752,7 +770,7 @@ if __name__ == "__main__":
             "iter": max_iters,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss.item(),
+            "loss": loss_val,
             "args": vars(args),
             "vocab_size": vocab_size,
             "mask_token_id": mask_token_id,

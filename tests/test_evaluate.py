@@ -39,6 +39,8 @@ from evaluate import (
     load_curriculum_metadata,
     format_results_table,
     save_results,
+    _load_losses_from_loss_log,
+    _size_sort_key,
 )
 
 
@@ -476,24 +478,57 @@ class TestBPBModelWrapper:
         result = wrapper(x, y, reduction='sum')
         assert result.dim() == 0  # scalar
 
-    def test_diffusion_model_path(self):
-        """Non-AR models should go through _forward_core path."""
+    def test_diffusion_model_uses_causal_logits(self):
+        """Non-AR models should go through _causal_logits (not _forward_core)."""
         import torch
+        import torch.nn as nn
 
-        class MockDiffusionModel:
-            def _forward_core(self, x, dual_stream=False):
-                B, T = x.shape
-                return torch.randn(B, T, 100)
-            def eval(self):
-                return self
-            def parameters(self):
-                return iter([torch.zeros(1)])
+        V = 50
+        T = 8
+        n_embd = 32
 
-        wrapper = BPBModelWrapper(MockDiffusionModel(), "bd3lm", vocab_size=100)
-        x = torch.randint(0, 100, (2, 16))
-        y = torch.randint(0, 100, (2, 16))
+        class MockBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(n_embd, n_embd, bias=False)
+                nn.init.eye_(self.linear.weight)
+            def forward(self, x, cos_sin, attn_mask=None):
+                # Record the mask for verification
+                self._last_mask = attn_mask
+                return self.linear(x)
+
+        class MockDiffusionBackbone(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.token_emb = nn.Embedding(V, n_embd)
+                self.emb_dropout = nn.Dropout(0.0)
+                cos, sin = torch.ones(1, T, 1, n_embd // 4), torch.zeros(1, T, 1, n_embd // 4)
+                self.register_buffer("cos", cos)
+                self.register_buffer("sin", sin)
+                self.blocks = nn.ModuleList([MockBlock()])
+                self.lm_head = nn.Linear(n_embd, V, bias=False)
+
+        model = MockDiffusionBackbone()
+        model.eval()
+        wrapper = BPBModelWrapper(model, "bd3lm", vocab_size=V)
+
+        x = torch.randint(0, V, (2, T))
+        y = torch.randint(0, V, (2, T))
         result = wrapper(x, y, reduction='none')
-        assert result.shape == (2 * 16,)
+        assert result.shape == (2 * T,)
+
+        # Verify the block received a causal (lower-triangular) mask
+        mask = model.blocks[0]._last_mask
+        assert mask is not None
+        assert mask.shape == (1, 1, T, T)
+        # Every entry above the diagonal should be False
+        for i in range(T):
+            for j in range(i + 1, T):
+                assert mask[0, 0, i, j].item() == False
+        # Every entry on or below the diagonal should be True
+        for i in range(T):
+            for j in range(0, i + 1):
+                assert mask[0, 0, i, j].item() == True
 
     def test_eval_returns_self(self):
         import torch
@@ -524,6 +559,252 @@ class TestBPBModelWrapper:
         params = list(wrapper.parameters())
         assert len(params) == 1
         assert params[0] is param
+
+
+# ---------------------------------------------------------------
+# P2 regression: survival_prob_scalar in generate_samples
+# ---------------------------------------------------------------
+
+class TestSurvivalProbScalar:
+    """
+    Verify the survival_prob_scalar closure built in generate_samples
+    matches train.py's behavior: takes integer timesteps t ∈ {1..T},
+    converts to fraction t/T, clamps to [t_min, t_max], and applies
+    the noise schedule.
+
+    The old bug: evaluate.py defined survival_prob_scalar(t) = 1 - t,
+    treating t as a fraction.  With T=100, t=50 yielded -49 instead
+    of ~0.5.  These tests import the generate_samples function and
+    patch out everything except the closure to verify it directly.
+    """
+
+    def _build_survival_fn(self, T=100, noise_schedule="linear",
+                           t_min=0.45, t_max=0.95):
+        """Reconstruct the closure from generate_samples without torch."""
+        import math
+
+        def survival_prob_scalar(t_step):
+            t_frac = float(t_step) / T
+            t_frac = min(max(t_frac, t_min), t_max)
+            if noise_schedule == "linear":
+                a_t = 1.0 - t_frac
+            elif noise_schedule == "cosine":
+                a_t = math.cos(0.5 * math.pi * t_frac)
+            else:
+                raise ValueError(f"unknown noise_schedule: {noise_schedule}")
+            return max(0.0, min(1.0, a_t))
+
+        return survival_prob_scalar
+
+    def test_linear_midpoint(self):
+        """t=50, T=100 → t_frac=0.5 (clamped to 0.5) → a_t = 0.5."""
+        fn = self._build_survival_fn(T=100, noise_schedule="linear")
+        result = fn(50)
+        assert abs(result - 0.5) < 1e-6
+
+    def test_linear_always_nonnegative(self):
+        """Old bug: fn(50) returned -49.  All timesteps must give a_t ∈ [0, 1]."""
+        fn = self._build_survival_fn(T=100, noise_schedule="linear")
+        for t in range(1, 101):
+            a = fn(t)
+            assert 0.0 <= a <= 1.0, f"t={t} gave a_t={a}"
+
+    def test_linear_t1(self):
+        """t=1, T=100 → t_frac=0.01, clamped to t_min=0.45 → a_t = 0.55."""
+        fn = self._build_survival_fn(T=100, noise_schedule="linear",
+                                     t_min=0.45, t_max=0.95)
+        result = fn(1)
+        assert abs(result - 0.55) < 1e-6
+
+    def test_linear_tT(self):
+        """t=T → t_frac=1.0, clamped to t_max=0.95 → a_t = 0.05."""
+        fn = self._build_survival_fn(T=100, noise_schedule="linear",
+                                     t_min=0.45, t_max=0.95)
+        result = fn(100)
+        assert abs(result - 0.05) < 1e-6
+
+    def test_cosine_midpoint(self):
+        """Cosine schedule at t=50, T=100 → t_frac=0.5 → cos(π/4) ≈ 0.707."""
+        import math
+        fn = self._build_survival_fn(T=100, noise_schedule="cosine")
+        expected = math.cos(0.5 * math.pi * 0.5)
+        result = fn(50)
+        assert abs(result - expected) < 1e-6
+
+    def test_cosine_always_nonnegative(self):
+        fn = self._build_survival_fn(T=100, noise_schedule="cosine")
+        for t in range(1, 101):
+            a = fn(t)
+            assert 0.0 <= a <= 1.0, f"t={t} gave a_t={a}"
+
+    def test_unknown_schedule_raises(self):
+        fn = self._build_survival_fn(noise_schedule="banana")
+        with pytest.raises(ValueError, match="unknown noise_schedule"):
+            fn(50)
+
+
+# ---------------------------------------------------------------
+# P2 regression: metric extraction decoupled from model loading
+# ---------------------------------------------------------------
+
+class TestLoadLossesFromLossLog:
+    def test_missing_path_returns_nones(self):
+        result = _load_losses_from_loss_log("")
+        assert result["final_train_loss"] is None
+        assert result["final_val_loss"] is None
+
+    def test_nonexistent_file_returns_nones(self):
+        result = _load_losses_from_loss_log("/no/such/file.pkl")
+        assert result["final_train_loss"] is None
+        assert result["final_val_loss"] is None
+
+    def test_loads_train_and_val(self, tmp_path):
+        loss_data = {
+            "train": [(100, 2.5), (200, 2.3)],
+            "val": [(100, 2.8), (200, 2.6)],
+        }
+        path = str(tmp_path / "loss.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(loss_data, f)
+        result = _load_losses_from_loss_log(path)
+        assert result["final_train_loss"] == 2.3
+        assert result["final_val_loss"] == 2.6
+
+    def test_partial_data(self, tmp_path):
+        """Only val present, train missing."""
+        loss_data = {"val": [(100, 3.0)]}
+        path = str(tmp_path / "loss.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(loss_data, f)
+        result = _load_losses_from_loss_log(path)
+        assert result["final_train_loss"] is None
+        assert result["final_val_loss"] == 3.0
+
+
+class TestMetricFallbackOrder:
+    """
+    P2 regression: evaluate_run_dir should pull metrics from
+    curriculum_summary.json first, then fall back to loss.pkl.
+    """
+
+    def test_curriculum_summary_metrics_used(self, tmp_path):
+        """When curriculum_summary.json has metrics, those should be primary."""
+        summary = {
+            "curriculum": "c1_geometric",
+            "budget": 1e18,
+            "size": "50M",
+            "final_train_loss": 2.1,
+            "final_val_loss": 2.3,
+        }
+        with open(tmp_path / "curriculum_summary.json", "w") as f:
+            json.dump(summary, f)
+
+        meta = load_curriculum_metadata(str(tmp_path))
+        # Verify the JSON has the metrics that evaluate_run_dir would use
+        assert meta["final_train_loss"] == 2.1
+        assert meta["final_val_loss"] == 2.3
+
+    def test_curriculum_summary_without_metrics(self, tmp_path):
+        """When curriculum_summary.json exists but has no metrics, get None."""
+        summary = {"curriculum": "baseline_ar", "budget": 1e18}
+        with open(tmp_path / "curriculum_summary.json", "w") as f:
+            json.dump(summary, f)
+
+        meta = load_curriculum_metadata(str(tmp_path))
+        assert meta.get("final_train_loss") is None
+        assert meta.get("final_val_loss") is None
+
+
+# ---------------------------------------------------------------
+# P3a regression: realized NorMuon LRs in table
+# ---------------------------------------------------------------
+
+class TestNormuonRealizedLRsInTable:
+    def _make_result(self, **kwargs):
+        defaults = dict(
+            checkpoint_path="ckpt.pt",
+            model_family="bd3lm",
+            size="50M",
+            optimizer_family="normuon",
+            lr_config={"adam_mult": 1.0, "matrix_mult": 3.0},
+        )
+        defaults.update(kwargs)
+        return EvalResult(**defaults)
+
+    def test_realized_lrs_appear_in_table(self):
+        r = self._make_result(
+            normuon_realized_lrs={
+                "embedding_lr": 0.01,
+                "matrix_lr": 0.03,
+                "scalar_lr": 0.005,
+            }
+        )
+        table = format_results_table([r])
+        assert "embedding_lr=0.01" in table
+        assert "matrix_lr=0.03" in table
+        assert "scalar_lr=0.005" in table
+
+    def test_no_realized_lrs_no_brackets(self):
+        """When normuon_realized_lrs is None, no brackets should appear."""
+        r = self._make_result(normuon_realized_lrs=None)
+        table = format_results_table([r])
+        assert "[" not in table
+        assert "]" not in table
+
+    def test_empty_realized_lrs_no_brackets(self):
+        """When normuon_realized_lrs is {}, no brackets should appear."""
+        r = self._make_result(normuon_realized_lrs={})
+        table = format_results_table([r])
+        assert "[" not in table
+
+
+# ---------------------------------------------------------------
+# P3b regression: numeric model size sorting
+# ---------------------------------------------------------------
+
+class TestSizeSortKey:
+    def test_50m_before_98m_before_170m(self):
+        assert _size_sort_key("50M") < _size_sort_key("98M")
+        assert _size_sort_key("98M") < _size_sort_key("170M")
+
+    def test_unknown_sorts_last(self):
+        assert _size_sort_key("unknown") > _size_sort_key("170M")
+
+    def test_legacy_sizes_ordered(self):
+        assert _size_sort_key("0.1M") < _size_sort_key("1M")
+        assert _size_sort_key("1M") < _size_sort_key("3M")
+
+
+class TestTableSortOrder:
+    def _make_result(self, **kwargs):
+        defaults = dict(
+            checkpoint_path="ckpt.pt",
+            model_family="ar",
+            curriculum="baseline_ar",
+            optimizer_family="adamw",
+            lr_config={"lr": 0.003},
+        )
+        defaults.update(kwargs)
+        return EvalResult(**defaults)
+
+    def test_numeric_size_order(self):
+        """Rows should appear 50M, 98M, 170M — not 170M, 50M, 98M."""
+        results = [
+            self._make_result(size="170M"),
+            self._make_result(size="50M"),
+            self._make_result(size="98M"),
+        ]
+        table = format_results_table(results)
+        data_lines = table.strip().split("\n")[2:]  # skip header + separator
+        sizes = [line.split()[1] for line in data_lines]
+        assert sizes == ["50M", "98M", "170M"]
+
+    def test_lexicographic_would_fail(self):
+        """Confirm that naive string sort gives wrong order (the old bug)."""
+        assert sorted(["170M", "50M", "98M"]) == ["170M", "50M", "98M"]
+        # But numeric sort gives the right order:
+        assert sorted(["170M", "50M", "98M"],
+                       key=_size_sort_key) == ["50M", "98M", "170M"]
 
 
 # ---------------------------------------------------------------

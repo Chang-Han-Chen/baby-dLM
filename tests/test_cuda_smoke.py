@@ -1,0 +1,646 @@
+"""
+test_cuda_smoke.py — End-to-end CUDA smoke tests.
+
+Run these on a GPU VM *before* launching the full LR sweep to verify that
+train.py, all three model families, both optimizers, ClimbMix data loading,
+torch.compile, checkpointing, and resume all work correctly on CUDA.
+
+Each test runs a very short training loop (≤30 steps) at the smallest
+ClimbMix size (50M) so total wall-time is ~2-5 minutes for the whole file.
+
+Usage:
+    pytest tests/test_cuda_smoke.py -v --tb=short
+
+Requirements:
+    - CUDA-capable GPU with ≥16 GB VRAM
+    - ClimbMix data downloaded (at least 1 train shard + val shard)
+      Run `python prepare.py` first if you haven't.
+"""
+
+import json
+import os
+import pickle
+import re
+import subprocess
+import sys
+import tempfile
+
+import pytest
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PYTHON = sys.executable
+
+# Regex matching the per-step log line from train.py
+_STEP_RE = re.compile(
+    r"step\s+(\d+)\s+\|.*?"
+    r"loss\s+([\d.]+)\s+\|.*?"
+    r"grad_norm\s+([\d.eE+\-]+)\s+\|.*?"
+    r"lr\s+([\d.eE+\-]+)"
+)
+
+
+def _run_train(args: list, timeout: int = 300) -> subprocess.CompletedProcess:
+    """Run train.py with the given extra args, returning CompletedProcess."""
+    cmd = [PYTHON, "train.py"] + args
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        # Print full output for debugging on the VM
+        print("=== STDOUT ===")
+        print(result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout)
+        print("=== STDERR ===")
+        print(result.stderr[-3000:] if len(result.stderr) > 3000 else result.stderr)
+    return result
+
+
+def _parse_steps(stdout: str):
+    """Extract (step, loss, grad_norm, lr) tuples from train.py stdout."""
+    records = []
+    for m in _STEP_RE.finditer(stdout):
+        records.append({
+            "step": int(m.group(1)),
+            "loss": float(m.group(2)),
+            "grad_norm": float(m.group(3)),
+            "lr": float(m.group(4)),
+        })
+    return records
+
+
+def _check_basic_training(stdout: str, min_steps: int = 5):
+    """Assert that training produced valid, decreasing-ish loss."""
+    records = _parse_steps(stdout)
+    assert len(records) >= min_steps, (
+        f"Expected ≥{min_steps} step records, got {len(records)}"
+    )
+    # Check no NaN/Inf in losses or grad norms
+    for r in records:
+        assert r["loss"] < 1e6, f"Loss exploded at step {r['step']}: {r['loss']}"
+        assert r["grad_norm"] < 1e6, f"Grad norm exploded at step {r['step']}: {r['grad_norm']}"
+        assert r["loss"] == r["loss"], f"NaN loss at step {r['step']}"  # NaN != NaN
+        assert r["grad_norm"] == r["grad_norm"], f"NaN grad norm at step {r['step']}"
+
+
+# Skip the entire module if CUDA isn't available.
+try:
+    import torch
+    _HAS_CUDA = torch.cuda.is_available()
+except Exception:
+    _HAS_CUDA = False
+
+pytestmark = pytest.mark.skipif(
+    not _HAS_CUDA,
+    reason="CUDA not available — run on a GPU machine",
+)
+
+
+# ---------------------------------------------------------------
+# Common args for short ClimbMix runs on 50M
+# ---------------------------------------------------------------
+
+# We use a small batch_size (16) and grad_accum=1 to keep VRAM modest
+# during smoke tests.  The real sweep uses batch=128, accum=2 (eff. 256).
+_BASE_ARGS = [
+    "--data", "climbmix",
+    "--n_embd", "512", "--n_layer", "16", "--n_head", "8",
+    "--batch_size", "16",
+    "--grad_accum_steps", "1",
+    "--block_size", "2048",
+    "--max_iters", "30",
+    "--eval_interval", "10",
+    "--eval_iters", "2",
+    "--warmup_iters", "5",
+    "--save_interval", "0",
+    "--num_final_samples", "0",
+    "--gpt2_eval_interval", "0",
+    "--gpt2_eval_samples", "0",
+    "--sample_interval", "0",
+    "--skip_final_eval", "false",
+    "--skip_final_checkpoint", "true",
+    "--warmup_stable", "true",
+    "--use_compile", "false",  # torch.compile tested separately
+]
+
+
+# ===============================================================
+# Test 1: Basic CUDA training for all 3 model families × AdamW
+# ===============================================================
+
+class TestCUDATraining:
+    """Verify that each model family trains on CUDA without errors."""
+
+    def test_ar_adamw(self, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--checkpoint_path", str(tmp_path / "ckpt_ar.pt"),
+            "--loss_log_path", str(tmp_path / "loss_ar.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"AR training failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout)
+
+    def test_mdlm_adamw(self, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "mdlm",
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--checkpoint_path", str(tmp_path / "ckpt_mdlm.pt"),
+            "--loss_log_path", str(tmp_path / "loss_mdlm.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"MDLM training failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout)
+
+    def test_bd3lm_adamw(self, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "16",
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--checkpoint_path", str(tmp_path / "ckpt_bd3.pt"),
+            "--loss_log_path", str(tmp_path / "loss_bd3.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"BD3-LM training failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout)
+
+
+# ===============================================================
+# Test 2: NorMuon optimizer on CUDA
+# ===============================================================
+
+class TestCUDANorMuon:
+    """Verify the grouped NorMuon optimizer works on CUDA."""
+
+    def test_ar_normuon(self, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "normuon",
+            "--learning_rate", "1.0",
+            "--min_lr", "0.1",
+            "--adam_mult", "1.0",
+            "--matrix_mult", "1.0",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"AR+NorMuon failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout)
+
+    def test_bd3lm_normuon(self, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "16",
+            "--optimizer", "normuon",
+            "--learning_rate", "1.0",
+            "--min_lr", "0.1",
+            "--adam_mult", "1.0",
+            "--matrix_mult", "1.0",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"BD3-LM+NorMuon failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout)
+
+    def test_mdlm_normuon(self, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "mdlm",
+            "--optimizer", "normuon",
+            "--learning_rate", "1.0",
+            "--min_lr", "0.1",
+            "--adam_mult", "1.0",
+            "--matrix_mult", "1.0",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"MDLM+NorMuon failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout)
+
+
+# ===============================================================
+# Test 3: torch.compile works on CUDA
+# ===============================================================
+
+class TestTorchCompile:
+    """Verify torch.compile doesn't break any model family."""
+
+    @pytest.mark.parametrize("model", ["ar", "mdlm", "bd3lm"])
+    def test_compile(self, model, tmp_path):
+        extra = ["--block_len", "16"] if model == "bd3lm" else []
+        args = _BASE_ARGS + [
+            "--model", model,
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--use_compile", "true",
+            "--max_iters", "15",  # shorter — compile overhead is high
+            "--eval_interval", "15",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ] + extra
+        result = _run_train(args, timeout=600)  # compile can be slow first time
+        assert result.returncode == 0, (
+            f"{model}+compile failed:\n{result.stderr[-1000:]}"
+        )
+
+
+# ===============================================================
+# Test 4: Checkpoint save + resume (weights-only warm start)
+# ===============================================================
+
+class TestCheckpointResume:
+    """Verify checkpointing and warm-start resume on CUDA."""
+
+    def test_save_and_resume(self, tmp_path):
+        ckpt_path = str(tmp_path / "ckpt.pt")
+        loss_path = str(tmp_path / "loss.pkl")
+
+        # Phase 1: Train AR for 20 steps, save checkpoint
+        args1 = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "20",
+            "--save_interval", "10",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", ckpt_path,
+            "--loss_log_path", loss_path,
+        ]
+        r1 = _run_train(args1)
+        assert r1.returncode == 0, f"Phase 1 failed:\n{r1.stderr[-1000:]}"
+        assert os.path.exists(ckpt_path), "Checkpoint not saved"
+
+        # Phase 2: Resume from checkpoint, train 10 more steps
+        loss_path2 = str(tmp_path / "loss2.pkl")
+        ckpt_path2 = str(tmp_path / "ckpt2.pt")
+        args2 = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "10",
+            "--resume_from", ckpt_path,
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", ckpt_path2,
+            "--loss_log_path", loss_path2,
+        ]
+        r2 = _run_train(args2)
+        assert r2.returncode == 0, f"Phase 2 (resume) failed:\n{r2.stderr[-1000:]}"
+        assert "Loaded model weights" in r2.stdout, "Resume message not found"
+        _check_basic_training(r2.stdout, min_steps=2)
+
+    def test_cross_family_resume(self, tmp_path):
+        """Test warm-starting BD3-LM from an AR checkpoint (curriculum-style)."""
+        ar_ckpt = str(tmp_path / "ar_ckpt.pt")
+        ar_loss = str(tmp_path / "ar_loss.pkl")
+
+        # Train AR
+        args_ar = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "15",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", ar_ckpt,
+            "--loss_log_path", ar_loss,
+        ]
+        r1 = _run_train(args_ar)
+        assert r1.returncode == 0, f"AR training failed:\n{r1.stderr[-1000:]}"
+
+        # Resume as BD3-LM
+        bd3_ckpt = str(tmp_path / "bd3_ckpt.pt")
+        bd3_loss = str(tmp_path / "bd3_loss.pkl")
+        args_bd3 = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "16",
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--max_iters", "15",
+            "--resume_from", ar_ckpt,
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", bd3_ckpt,
+            "--loss_log_path", bd3_loss,
+        ]
+        r2 = _run_train(args_bd3)
+        assert r2.returncode == 0, f"BD3-LM resume from AR failed:\n{r2.stderr[-1000:]}"
+        assert "Loaded model weights" in r2.stdout
+        _check_basic_training(r2.stdout, min_steps=2)
+
+
+# ===============================================================
+# Test 5: ClimbMix data loading works
+# ===============================================================
+
+class TestClimbMixData:
+    """Verify ClimbMix data pipeline on CUDA."""
+
+    def test_data_loads_and_tokenizes(self):
+        """Directly test prepare.py's dataloader without training."""
+        import torch
+        sys.path.insert(0, REPO_ROOT)
+        from prepare import Tokenizer, make_dataloader, DATA_DIR
+
+        # Check that data is present
+        tok = Tokenizer.from_directory(DATA_DIR)
+        assert tok.vocab_size == 8192, f"Unexpected vocab_size: {tok.vocab_size}"
+        assert tok.mask_token_id is not None, "mask_token_id not set"
+
+        # Get a batch
+        dl = make_dataloader(tok, batch_size=4, seq_len=2048, split="train")
+        batch = next(iter(dl))
+        assert batch.shape == (4, 2048), f"Unexpected batch shape: {batch.shape}"
+        assert batch.dtype == torch.long
+
+        # Verify tokens are in valid range
+        assert batch.min() >= 0
+        assert batch.max() < 8192
+
+    def test_val_data_loads(self):
+        """Verify the pinned validation shard loads."""
+        sys.path.insert(0, REPO_ROOT)
+        from prepare import Tokenizer, make_dataloader, DATA_DIR
+
+        tok = Tokenizer.from_directory(DATA_DIR)
+        dl = make_dataloader(tok, batch_size=4, seq_len=2048, split="val")
+        batch = next(iter(dl))
+        assert batch.shape == (4, 2048)
+
+
+# ===============================================================
+# Test 6: BD3-LM with different block_lens
+# ===============================================================
+
+class TestBD3BlockLens:
+    """Verify BD3-LM works with the block_lens used in curricula."""
+
+    @pytest.mark.parametrize("block_len", [2, 4, 8, 16, 64])
+    def test_block_len(self, block_len, tmp_path):
+        args = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", str(block_len),
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--max_iters", "10",
+            "--eval_interval", "10",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, (
+            f"BD3-LM block_len={block_len} failed:\n{result.stderr[-1000:]}"
+        )
+
+
+# ===============================================================
+# Test 7: bfloat16 autocast works (used by real training)
+# ===============================================================
+
+class TestBFloat16:
+    """Verify bfloat16 autocast works for all model families."""
+
+    @pytest.mark.parametrize("model", ["ar", "mdlm", "bd3lm"])
+    def test_bf16_training(self, model, tmp_path):
+        """train.py uses autocast(bf16) on CUDA by default — verify it works."""
+        extra = ["--block_len", "16"] if model == "bd3lm" else []
+        args = _BASE_ARGS + [
+            "--model", model,
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--max_iters", "10",
+            "--eval_interval", "10",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ] + extra
+        result = _run_train(args)
+        assert result.returncode == 0
+        # Verify no "RuntimeError" about dtype mismatches in stderr
+        assert "RuntimeError" not in result.stderr
+
+
+# ===============================================================
+# Test 8: Full batch_size=128 fits in VRAM (memory test)
+# ===============================================================
+
+class TestVRAMFit:
+    """Verify production config (micro-batch=128, grad_accum=2, eff. 256) fits."""
+
+    @pytest.mark.parametrize("model", ["ar", "mdlm", "bd3lm"])
+    def test_full_batch_fits(self, model, tmp_path):
+        extra = ["--block_len", "16"] if model == "bd3lm" else []
+        args = [
+            "--data", "climbmix",
+            "--n_embd", "512", "--n_layer", "16", "--n_head", "8",
+            "--batch_size", "128",
+            "--grad_accum_steps", "2",
+            "--block_size", "2048",
+            "--max_iters", "3",
+            "--eval_interval", "100",  # skip eval
+            "--eval_iters", "1",
+            "--warmup_iters", "1",
+            "--save_interval", "0",
+            "--num_final_samples", "0",
+            "--gpt2_eval_interval", "0",
+            "--gpt2_eval_samples", "0",
+            "--sample_interval", "0",
+            "--skip_final_eval", "true",
+            "--skip_final_checkpoint", "true",
+            "--warmup_stable", "true",
+            "--use_compile", "false",
+            "--model", model,
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ] + extra
+        result = _run_train(args, timeout=300)
+        assert result.returncode == 0, (
+            f"{model} OOM at batch=128×accum=2:\n{result.stderr[-1000:]}"
+        )
+
+
+# ===============================================================
+# Test 8b: Gradient accumulation produces valid training
+# ===============================================================
+
+class TestGradAccum:
+    """Verify gradient accumulation runs correctly on CUDA."""
+
+    def test_accum_2_trains(self, tmp_path):
+        """grad_accum_steps=2 should train without errors."""
+        args = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--grad_accum_steps", "2",
+            "--max_iters", "15",
+            "--eval_interval", "15",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, (
+            f"grad_accum=2 failed:\n{result.stderr[-1000:]}"
+        )
+        _check_basic_training(result.stdout, min_steps=2)
+
+    def test_accum_logs_effective_batch(self, tmp_path):
+        """Training info should show effective_batch_size when accum > 1."""
+        args = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--grad_accum_steps", "2",
+            "--max_iters", "5",
+            "--eval_interval", "100",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0
+        assert "effective_batch_size: 32" in result.stdout, (
+            "Expected effective_batch_size: 32 (16 * 2) in output"
+        )
+        assert "grad_accum_steps: 2" in result.stdout
+
+
+# ===============================================================
+# Test 9: run_lr_sweep.py dry-run (validates command building)
+# ===============================================================
+
+class TestSweepInfra:
+    """Verify the sweep infrastructure builds valid commands."""
+
+    def test_lr_sweep_dry_run(self):
+        """run_lr_sweep.py --dry-run should succeed for all combos."""
+        cmd = [
+            PYTHON, "run_lr_sweep.py",
+            "--optimizer", "adamw",
+            "--model", "ar",
+            "--size", "50M",
+            "--dry-run",
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=REPO_ROOT, timeout=30,
+        )
+        assert result.returncode == 0, f"Dry-run failed:\n{result.stderr}"
+        assert "dry-run" in result.stdout.lower()
+
+    def test_normuon_sweep_dry_run(self):
+        """Normuon sweep dry-run should build valid 2D grid commands."""
+        cmd = [
+            PYTHON, "run_lr_sweep.py",
+            "--optimizer", "normuon",
+            "--model", "ar",
+            "--size", "50M",
+            "--dry-run",
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=REPO_ROOT, timeout=30,
+        )
+        assert result.returncode == 0, f"Dry-run failed:\n{result.stderr}"
+        # Should show multiple (adam_mult, matrix_mult) combos
+        assert "adam_mult" in result.stdout
+
+    def test_curriculum_dry_run(self):
+        """run_curriculum.py --dry-run should succeed."""
+        cmd = [
+            PYTHON, "run_curriculum.py",
+            "--curriculum", "baseline_ar",
+            "--size", "50M",
+            "--budget", "1e18",
+            "--dry-run",
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=REPO_ROOT, timeout=30,
+        )
+        assert result.returncode == 0, f"Curriculum dry-run failed:\n{result.stderr}"
+
+
+# ===============================================================
+# Test 10: Eval pipeline works on a CUDA checkpoint
+# ===============================================================
+
+class TestEvalPipeline:
+    """Verify evaluate.py can load and evaluate a CUDA checkpoint."""
+
+    def test_eval_checkpoint(self, tmp_path):
+        ckpt_path = str(tmp_path / "ckpt.pt")
+        loss_path = str(tmp_path / "loss.pkl")
+
+        # Train briefly to produce a checkpoint
+        args = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "15",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", ckpt_path,
+            "--loss_log_path", loss_path,
+        ]
+        r = _run_train(args)
+        assert r.returncode == 0
+
+        # Run evaluate.py on the checkpoint
+        eval_cmd = [
+            PYTHON, "evaluate.py",
+            "--checkpoint", ckpt_path,
+            "--skip-bpb",  # BPB is slow; just test loading + metadata
+            "--num-samples", "1",
+        ]
+        r2 = subprocess.run(
+            eval_cmd, capture_output=True, text=True,
+            cwd=REPO_ROOT, timeout=120,
+        )
+        assert r2.returncode == 0, f"evaluate.py failed:\n{r2.stderr[-1000:]}"
+
+
+# ===============================================================
+# Test 11: Generation produces valid output on CUDA
+# ===============================================================
+
+class TestCUDAGeneration:
+    """Verify sample generation works on CUDA for all families."""
+
+    @pytest.mark.parametrize("model", ["ar", "mdlm", "bd3lm"])
+    def test_generates_samples(self, model, tmp_path):
+        extra = ["--block_len", "16"] if model == "bd3lm" else []
+        args = _BASE_ARGS + [
+            "--model", model,
+            "--optimizer", "adamw",
+            "--learning_rate", "3e-3",
+            "--min_lr", "3e-4",
+            "--max_iters", "10",
+            "--eval_interval", "100",
+            "--num_final_samples", "2",
+            "--skip_final_eval", "true",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ] + extra
+        result = _run_train(args)
+        assert result.returncode == 0, f"{model} generation failed:\n{result.stderr[-1000:]}"
+        assert "--- Sample 1 ---" in result.stdout, "No samples generated"
+        assert "--- Sample 2 ---" in result.stdout, "Only one sample generated"

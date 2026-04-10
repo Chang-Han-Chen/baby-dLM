@@ -82,9 +82,13 @@ LEGACY_ISOFLOP_BATCH_SIZE = 128
 LEGACY_ISOFLOP_BLOCK_SIZE = 256
 
 # ClimbMix regime — seq_len = 2048
+# Micro-batch (what fits in GPU VRAM for a single fwd/bwd pass)
 CLIMBMIX_BATCH_SIZE = 128
 CLIMBMIX_BLOCK_SIZE = 2048   # MAX_SEQ_LEN from prepare.py
-CLIMBMIX_TOKENS_PER_STEP = CLIMBMIX_BATCH_SIZE * CLIMBMIX_BLOCK_SIZE  # 262 144
+# Gradient accumulation: 2 micro-batches → effective batch = 256
+CLIMBMIX_GRAD_ACCUM = 2
+# Tokens per optimizer step (effective):
+CLIMBMIX_TOKENS_PER_STEP = CLIMBMIX_BATCH_SIZE * CLIMBMIX_BLOCK_SIZE * CLIMBMIX_GRAD_ACCUM  # 524 288
 
 # Backward-compatible aliases (used by legacy sweep scripts)
 ISOFLOP_BATCH_SIZE = LEGACY_ISOFLOP_BATCH_SIZE
@@ -506,6 +510,7 @@ def build_command(
     batch_size=None,
     block_size=None,
     block_len=None,
+    grad_accum_steps=None,
     dropout=None,
     lr=None,
     eval_interval=300,
@@ -530,8 +535,8 @@ def build_command(
     Build a train.py command line.
 
     Automatically selects ClimbMix defaults (data="climbmix",
-    block_size=2048, batch_size=128) for ClimbMix model sizes,
-    and legacy defaults for TinyShakespeare sizes.
+    block_size=2048, batch_size=128, grad_accum_steps=2) for ClimbMix
+    model sizes, and legacy defaults for TinyShakespeare sizes.
 
     For optimizer="normuon", adam_mult and matrix_mult default to the
     calibrated values from get_optimal_normuon() if available, falling
@@ -547,6 +552,8 @@ def build_command(
         batch_size = CLIMBMIX_BATCH_SIZE if is_climbmix else LEGACY_ISOFLOP_BATCH_SIZE
     if block_size is None:
         block_size = CLIMBMIX_BLOCK_SIZE if is_climbmix else LEGACY_ISOFLOP_BLOCK_SIZE
+    if grad_accum_steps is None:
+        grad_accum_steps = CLIMBMIX_GRAD_ACCUM if is_climbmix else 1
 
     # Warmup: default to 5% of max_iters (plan §4/§5 policy), min 1.
     # Legacy default of 100 is preserved when warmup_iters is passed explicitly.
@@ -592,7 +599,7 @@ def build_command(
     ckpt_path = os.path.join(out_dir, "ckpt.pt")
 
     cmd = [
-        sys.executable, "train.py",
+        sys.executable, "-u", "train.py",
         "--data", data,
         "--model", model,
         "--n_embd", str(n_embd),
@@ -614,6 +621,7 @@ def build_command(
         "--num_final_samples", str(num_final_samples),
         "--loss_log_path", loss_path,
         "--checkpoint_path", ckpt_path,
+        "--grad_accum_steps", str(grad_accum_steps),
     ]
 
     # train.py defines these with type=str2bool, so pass explicit values.

@@ -202,8 +202,11 @@ class BPBModelWrapper:
     (next-token prediction format: x = tokens[:, :-1], y = tokens[:, 1:]).
 
     For AR models: compute logits from x, take CE against y.
-    For diffusion/block models (MDLM, BD3-LM): same — the BPB metric
-    measures next-token prediction quality regardless of training objective.
+    For diffusion/block models (MDLM, BD3-LM): run the backbone with an
+    explicit causal mask so position i can only attend to positions 0..i.
+    This is critical — the diffusion backbone normally uses bidirectional
+    (MDLM) or block-causal (BD3-LM) attention, both of which leak future
+    tokens and break the next-token-prediction BPB contract.
     """
 
     def __init__(self, model, model_family: str, vocab_size: int):
@@ -211,34 +214,59 @@ class BPBModelWrapper:
         self.model_family = model_family
         self.vocab_size = vocab_size
 
+    def _causal_logits(self, x):
+        """
+        Run the DiffusionBackbone manually with a strictly causal mask.
+
+        Replicates _forward_core but overrides _select_attn_mask with a
+        lower-triangular boolean mask so each position attends only to
+        itself and earlier positions — matching the AR model's behavior.
+        """
+        import torch
+        from torch.nn import functional as F
+
+        B, Tseq = x.size()
+
+        # Build strict causal mask: (1, 1, T, T), True = attend
+        causal = torch.tril(
+            torch.ones(Tseq, Tseq, device=x.device, dtype=torch.bool)
+        )[None, None, :, :]
+
+        # Embed + norm (same as _forward_core)
+        h = self.model.token_emb(x)
+        h = self.model.emb_dropout(h)
+        h = F.rms_norm(h, (h.size(-1),))
+
+        # Rotary embeddings — single-stream positions 0..T-1
+        cos_sin = (self.model.cos[:, :Tseq], self.model.sin[:, :Tseq])
+
+        # Forward through transformer blocks with causal mask
+        for block in self.model.blocks:
+            h = block(h, cos_sin, attn_mask=causal)
+
+        h = F.rms_norm(h, (h.size(-1),))
+        return self.model.lm_head(h)
+
     def __call__(self, x, y, reduction='none'):
         import torch
         import torch.nn.functional as F
 
         with torch.no_grad():
             if self.model_family == "ar":
-                # AR forward: model(idx, targets) -> (logits, loss)
-                # We need per-token losses, so compute manually.
+                # AR model uses its own causal attention (is_causal=True)
                 logits, _ = self.model(x)
-                # logits: (B, T, V); predict position i -> target at i+1
-                # x is already inputs (tokens[:, :-1]) and y is targets (tokens[:, 1:])
-                # from prepare.make_dataloader, so logits align with y directly.
-                per_token = F.cross_entropy(
-                    logits.reshape(-1, self.vocab_size),
-                    y.reshape(-1),
-                    reduction="none",
-                )
             else:
-                # Diffusion models (MDLM, BD3-LM): use backbone's forward
-                # in next-token prediction mode.  The backbone accepts
-                # (idx, targets, mask) and computes per-token CE internally.
-                # For BPB we need per-token losses with all positions supervised.
-                logits = self.model._forward_core(x, dual_stream=False)
-                per_token = F.cross_entropy(
-                    logits.reshape(-1, self.vocab_size),
-                    y.reshape(-1),
-                    reduction="none",
-                )
+                # Diffusion models: run backbone with explicit causal mask
+                # so BPB measures true next-token prediction quality.
+                logits = self._causal_logits(x)
+
+            # x is tokens[:, :-1], y is tokens[:, 1:] from prepare's
+            # dataloader, so logits at position i predict y[i] directly.
+            per_token = F.cross_entropy(
+                logits.reshape(-1, self.vocab_size),
+                y.reshape(-1),
+                reduction="none",
+            )
 
         if reduction == 'none':
             return per_token
@@ -305,9 +333,25 @@ def generate_samples(
 
     device = next(model.parameters()).device
 
-    # Linear noise schedule for survival prob
-    def survival_prob_scalar(t_frac):
-        return 1.0 - t_frac
+    # Reconstruct the same survival-probability schedule used in training.
+    # The samplers pass integer timesteps t ∈ {1, ..., T}, NOT fractions.
+    # train.py converts: t_frac = t_step / T, clamped to [t_min, t_max],
+    # then applies the noise schedule (linear or cosine).
+    noise_schedule = args.get("noise_schedule", "linear")
+    t_min = args.get("t_min", 0.45)
+    t_max = args.get("t_max", 0.95)
+
+    def survival_prob_scalar(t_step):
+        import math as _math
+        t_frac = float(t_step) / T
+        t_frac = min(max(t_frac, t_min), t_max)
+        if noise_schedule == "linear":
+            a_t = 1.0 - t_frac
+        elif noise_schedule == "cosine":
+            a_t = _math.cos(0.5 * _math.pi * t_frac)
+        else:
+            raise ValueError(f"unknown noise_schedule: {noise_schedule}")
+        return max(0.0, min(1.0, a_t))
 
     samples = []
     for i in range(num_samples):
@@ -336,6 +380,27 @@ def generate_samples(
 # Single checkpoint evaluation
 # ---------------------------------------------------------------
 
+def _load_losses_from_loss_log(loss_log_path: str) -> Dict[str, Optional[float]]:
+    """
+    Read final train/val loss from a loss.pkl file.
+
+    Returns {"final_train_loss": float|None, "final_val_loss": float|None}.
+    """
+    result: Dict[str, Optional[float]] = {
+        "final_train_loss": None,
+        "final_val_loss": None,
+    }
+    if not loss_log_path or not os.path.exists(loss_log_path):
+        return result
+    with open(loss_log_path, "rb") as f:
+        loss_data = pickle.load(f)
+    if loss_data.get("train"):
+        result["final_train_loss"] = loss_data["train"][-1][1]
+    if loss_data.get("val"):
+        result["final_val_loss"] = loss_data["val"][-1][1]
+    return result
+
+
 def evaluate_checkpoint(
     ckpt_path: str,
     *,
@@ -346,74 +411,89 @@ def evaluate_checkpoint(
     num_samples: int = 0,
     batch_size: int = 32,
     device: str = "cuda",
+    # Pre-resolved metrics — used by evaluate_run_dir to pass in values
+    # from curriculum_summary.json so we can skip model loading when only
+    # stored metrics are needed.
+    preloaded_train_loss: Optional[float] = None,
+    preloaded_val_loss: Optional[float] = None,
 ) -> EvalResult:
     """
-    Run full evaluation on a single checkpoint.
+    Evaluate a single checkpoint.
 
-    Returns an EvalResult with BPB, samples, and all metadata.
+    Metric resolution order for final_train_loss / final_val_loss:
+      1. preloaded_* kwargs (from curriculum_summary.json via evaluate_run_dir)
+      2. loss.pkl referenced by checkpoint args
+      3. None
+
+    The model is loaded ONLY when BPB or samples are requested.
+    Metadata (size, LR config, optimizer family) comes from the checkpoint
+    header, which is lightweight (no model weights).
     """
-    import torch
-
     print(f"\nEvaluating: {ckpt_path}")
 
-    # Load model
-    model, meta, model_family = load_model_for_eval(ckpt_path, device=device)
+    # --- Lightweight metadata (no model weights) ---
+    meta = load_checkpoint_metadata(ckpt_path)
     ckpt_args = meta["args"]
+    model_family = ckpt_args.get("model", "ar")
 
-    # Infer size if not provided
     if size is None:
         size = infer_size_from_args(ckpt_args)
         if size is None:
             size = "unknown"
     print(f"  model={model_family}  size={size}  iter={meta['iter']}")
 
-    # LR config
     lr_config = infer_lr_config(ckpt_args, meta)
     optimizer_family = meta.get("optimizer_family", ckpt_args.get("optimizer", "adamw"))
-
-    # Normuon realized LRs (if applicable)
     normuon_realized = meta.get("normuon_lrs")
 
-    # BPB evaluation
+    # --- Resolve final train/val loss (no model load needed) ---
+    final_train_loss = preloaded_train_loss
+    final_val_loss = preloaded_val_loss
+
+    # Fallback to loss.pkl if preloaded values are not available
+    if final_train_loss is None or final_val_loss is None:
+        loss_log_path = ckpt_args.get("loss_log_path")
+        log_losses = _load_losses_from_loss_log(loss_log_path)
+        if final_train_loss is None:
+            final_train_loss = log_losses["final_train_loss"]
+        if final_val_loss is None:
+            final_val_loss = log_losses["final_val_loss"]
+
+    # --- Model-dependent evaluation (only if needed) ---
+    need_model = (not skip_bpb) or (num_samples > 0)
+
     bpb = None
-    if not skip_bpb:
-        data_source = ckpt_args.get("data", "climbmix")
-        if data_source == "climbmix":
-            from prepare import Tokenizer, evaluate_bpb
-            tokenizer = Tokenizer.from_directory()
-            wrapper = BPBModelWrapper(model, model_family, meta["vocab_size"])
-            wrapper.eval()
-            bpb = evaluate_bpb(wrapper, tokenizer, batch_size)
-            print(f"  BPB = {bpb:.4f}")
-        else:
-            print(f"  BPB skipped (data_source={data_source}, not climbmix)")
-
-    # Load final train/val loss from the loss log if available
-    final_train_loss = None
-    final_val_loss = None
-    loss_log_path = ckpt_args.get("loss_log_path")
-    if loss_log_path and os.path.exists(loss_log_path):
-        with open(loss_log_path, "rb") as f:
-            loss_data = pickle.load(f)
-        if loss_data.get("train"):
-            final_train_loss = loss_data["train"][-1][1]
-        if loss_data.get("val"):
-            final_val_loss = loss_data["val"][-1][1]
-
-    # Generation samples
     samples = []
-    if num_samples > 0:
-        print(f"  Generating {num_samples} samples...")
-        samples = generate_samples(
-            model, model_family, meta,
-            num_samples=num_samples,
-            prompt_len=16,
-        )
-        for i, s in enumerate(samples):
-            print(f"\n  --- Sample {i+1} ---")
-            print(f"  {s[:200]}{'...' if len(s) > 200 else ''}")
 
-    result = EvalResult(
+    if need_model:
+        model, meta, model_family = load_model_for_eval(ckpt_path, device=device)
+
+        # BPB
+        if not skip_bpb:
+            data_source = ckpt_args.get("data", "climbmix")
+            if data_source == "climbmix":
+                from prepare import Tokenizer, evaluate_bpb
+                tokenizer = Tokenizer.from_directory()
+                wrapper = BPBModelWrapper(model, model_family, meta["vocab_size"])
+                wrapper.eval()
+                bpb = evaluate_bpb(wrapper, tokenizer, batch_size)
+                print(f"  BPB = {bpb:.4f}")
+            else:
+                print(f"  BPB skipped (data_source={data_source}, not climbmix)")
+
+        # Samples
+        if num_samples > 0:
+            print(f"  Generating {num_samples} samples...")
+            samples = generate_samples(
+                model, model_family, meta,
+                num_samples=num_samples,
+                prompt_len=16,
+            )
+            for i, s in enumerate(samples):
+                print(f"\n  --- Sample {i+1} ---")
+                print(f"  {s[:200]}{'...' if len(s) > 200 else ''}")
+
+    return EvalResult(
         checkpoint_path=ckpt_path,
         model_family=model_family,
         size=size,
@@ -428,8 +508,6 @@ def evaluate_checkpoint(
         samples=samples,
         checkpoint_iter=meta["iter"],
     )
-
-    return result
 
 
 # ---------------------------------------------------------------
@@ -480,17 +558,30 @@ def evaluate_run_dir(
     batch_size: int = 32,
     device: str = "cuda",
 ) -> Optional[EvalResult]:
-    """Evaluate the final checkpoint in a curriculum run directory."""
+    """
+    Evaluate the final checkpoint in a curriculum run directory.
+
+    Metric fallback order for final_train_loss / final_val_loss:
+      1. curriculum_summary.json (written by run_curriculum.py)
+      2. loss.pkl referenced by checkpoint args
+      3. None
+
+    The model is loaded only when BPB or samples are requested.
+    """
     ckpt_path = find_final_checkpoint(run_dir)
     if ckpt_path is None:
         print(f"  No checkpoint found in {run_dir}")
         return None
 
-    # Extract metadata from curriculum summary if available
+    # Extract metadata and stored metrics from curriculum summary
     cur_meta = load_curriculum_metadata(run_dir)
     curriculum = cur_meta.get("curriculum", "")
     flop_budget = cur_meta.get("budget", 0.0)
     size = cur_meta.get("size")
+
+    # Pull stored train/val losses — primary source for ELBO-centric eval
+    preloaded_train = cur_meta.get("final_train_loss")
+    preloaded_val = cur_meta.get("final_val_loss")
 
     return evaluate_checkpoint(
         ckpt_path,
@@ -501,6 +592,8 @@ def evaluate_run_dir(
         num_samples=num_samples,
         batch_size=batch_size,
         device=device,
+        preloaded_train_loss=preloaded_train,
+        preloaded_val_loss=preloaded_val,
     )
 
 
@@ -549,6 +642,18 @@ def evaluate_sweep_dir(
 # Results table formatting and persistence
 # ---------------------------------------------------------------
 
+def _size_sort_key(size_label: str) -> int:
+    """
+    Return numeric non-embedding params for sorting, so rows appear in
+    true scaling order (50M < 98M < 170M) rather than lexicographic
+    (170M < 50M < 98M).  Unknown sizes sort last.
+    """
+    try:
+        return ec.non_embedding_params(size_label)
+    except KeyError:
+        return float("inf")
+
+
 def format_results_table(results: List[EvalResult]) -> str:
     """Format results as a human-readable table."""
     lines = []
@@ -560,7 +665,7 @@ def format_results_table(results: List[EvalResult]) -> str:
     lines.append("-" * 130)
 
     for r in sorted(results, key=lambda x: (
-        x.model_family, x.size, x.curriculum, x.optimizer_family
+        x.model_family, _size_sort_key(x.size), x.curriculum, x.optimizer_family
     )):
         train = f"{r.final_train_loss:.4f}" if r.final_train_loss is not None else "—"
         val = f"{r.final_val_loss:.4f}" if r.final_val_loss is not None else "—"
@@ -573,6 +678,11 @@ def format_results_table(results: List[EvalResult]) -> str:
             am = r.lr_config.get("adam_mult", "?")
             mm = r.lr_config.get("matrix_mult", "?")
             lr_str = f"am={am},mm={mm}"
+            # Append realized per-group LRs when available (§6.6 requirement)
+            if r.normuon_realized_lrs:
+                realized_parts = [f"{k}={v:.4g}" for k, v in
+                                  sorted(r.normuon_realized_lrs.items())]
+                lr_str += " [" + ",".join(realized_parts) + "]"
         else:
             lr_str = f"lr={r.lr_config.get('lr', '?')}"
 
