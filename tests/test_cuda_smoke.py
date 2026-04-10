@@ -680,6 +680,217 @@ class TestEvalPipeline:
 # ===============================================================
 
 @_skip_climbmix
+class TestPhase1Preflight:
+    """
+    Pre-flight test for run_phase1.sh.
+
+    Reproduces the exact checkpoint-sharing flow at miniature scale:
+      1. AR warmup (20 steps, save_interval=5) → numbered checkpoints
+      2. BD3-LM resume from a numbered AR checkpoint (curriculum-style)
+      3. BD3-LM chained resume (C1-style: bl=2 → bl=4)
+
+    Run this on the VM before launching the overnight job:
+        pytest tests/test_cuda_smoke.py::TestPhase1Preflight -v --tb=short
+    """
+
+    def test_step_numbered_checkpoints_produced(self, tmp_path):
+        """AR warmup produces ckpt_step{N}.pt at the correct steps."""
+        ckpt_path = str(tmp_path / "ckpt.pt")
+        args = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "20",
+            "--save_interval", "5",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", ckpt_path,
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"AR warmup failed:\n{result.stderr[-1000:]}"
+
+        # Verify step-numbered checkpoints exist at the right steps
+        for step in [5, 10, 15, 20]:
+            step_ckpt = str(tmp_path / f"ckpt_step{step}.pt")
+            assert os.path.exists(step_ckpt), (
+                f"ckpt_step{step}.pt missing — "
+                f"expected after {step} optimizer updates"
+            )
+
+        # The final checkpoint should also exist
+        assert os.path.exists(ckpt_path), "Final ckpt.pt missing"
+
+        # Verify that ckpt_step20.pt has the same model weights as ckpt.pt
+        import torch
+        s20 = torch.load(str(tmp_path / "ckpt_step20.pt"), map_location="cpu")
+        sfinal = torch.load(ckpt_path, map_location="cpu")
+        for key in s20["model_state_dict"]:
+            assert torch.equal(s20["model_state_dict"][key],
+                               sfinal["model_state_dict"][key]), (
+                f"ckpt_step20.pt and ckpt.pt differ on {key}"
+            )
+
+    def test_c0_checkpoint_sharing_flow(self, tmp_path):
+        """
+        C0-style: AR warmup → BD3-LM(16) resumes from numbered checkpoint.
+
+        Mimics: 20 AR steps, then branch at step 10 for 10 BD3 steps.
+        """
+        ar_ckpt = str(tmp_path / "ar" / "ckpt.pt")
+        os.makedirs(tmp_path / "ar", exist_ok=True)
+
+        # AR warmup
+        args_ar = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "20",
+            "--save_interval", "5",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", ar_ckpt,
+            "--loss_log_path", str(tmp_path / "ar" / "loss.pkl"),
+        ]
+        r1 = _run_train(args_ar)
+        assert r1.returncode == 0, f"AR warmup failed:\n{r1.stderr[-1000:]}"
+
+        # Resume BD3-LM from AR step 10
+        ar_step10 = str(tmp_path / "ar" / "ckpt_step10.pt")
+        assert os.path.exists(ar_step10), "ckpt_step10.pt not found"
+
+        bd3_dir = tmp_path / "c0_bd3"
+        os.makedirs(bd3_dir, exist_ok=True)
+        args_bd3 = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "16",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "10",
+            "--resume_from", ar_step10,
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", str(bd3_dir / "ckpt.pt"),
+            "--loss_log_path", str(bd3_dir / "loss.pkl"),
+        ]
+        r2 = _run_train(args_bd3)
+        assert r2.returncode == 0, f"BD3-LM resume failed:\n{r2.stderr[-1000:]}"
+        assert "Loaded model weights" in r2.stdout
+        _check_basic_training(r2.stdout, min_steps=2)
+
+    def test_c1_chained_resume_flow(self, tmp_path):
+        """
+        C1-style: AR → BD3(bl=2) → BD3(bl=4), chained checkpoints.
+
+        Verifies two consecutive cross-block_len resumes work.
+        """
+        # Stage 0: AR (10 steps)
+        ar_dir = tmp_path / "ar"
+        os.makedirs(ar_dir, exist_ok=True)
+        args_ar = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "10",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", str(ar_dir / "ckpt.pt"),
+            "--loss_log_path", str(ar_dir / "loss.pkl"),
+        ]
+        r0 = _run_train(args_ar)
+        assert r0.returncode == 0, f"C1 AR stage failed:\n{r0.stderr[-1000:]}"
+
+        # Stage 1: BD3(bl=2) from AR checkpoint
+        bl2_dir = tmp_path / "bl2"
+        os.makedirs(bl2_dir, exist_ok=True)
+        args_bl2 = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "2",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "10",
+            "--resume_from", str(ar_dir / "ckpt.pt"),
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", str(bl2_dir / "ckpt.pt"),
+            "--loss_log_path", str(bl2_dir / "loss.pkl"),
+        ]
+        r1 = _run_train(args_bl2)
+        assert r1.returncode == 0, f"C1 bl=2 stage failed:\n{r1.stderr[-1000:]}"
+        assert "Loaded model weights" in r1.stdout
+
+        # Stage 2: BD3(bl=4) from bl=2 checkpoint
+        bl4_dir = tmp_path / "bl4"
+        os.makedirs(bl4_dir, exist_ok=True)
+        args_bl4 = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "4",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "10",
+            "--resume_from", str(bl2_dir / "ckpt.pt"),
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", str(bl4_dir / "ckpt.pt"),
+            "--loss_log_path", str(bl4_dir / "loss.pkl"),
+        ]
+        r2 = _run_train(args_bl4)
+        assert r2.returncode == 0, f"C1 bl=4 stage failed:\n{r2.stderr[-1000:]}"
+        assert "Loaded model weights" in r2.stdout
+        _check_basic_training(r2.stdout, min_steps=2)
+
+    def test_normuon_checkpoint_sharing_flow(self, tmp_path):
+        """Same as C0 flow but with NorMuon optimizer."""
+        ar_dir = tmp_path / "ar"
+        os.makedirs(ar_dir, exist_ok=True)
+
+        args_ar = _BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "normuon",
+            "--learning_rate", "1.0",
+            "--min_lr", "0.1",
+            "--adam_mult", "0.3",
+            "--matrix_mult", "1.0",
+            "--max_iters", "20",
+            "--save_interval", "10",
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", str(ar_dir / "ckpt.pt"),
+            "--loss_log_path", str(ar_dir / "loss.pkl"),
+        ]
+        r1 = _run_train(args_ar)
+        assert r1.returncode == 0, f"NorMuon AR warmup failed:\n{r1.stderr[-1000:]}"
+
+        # Resume BD3-LM from step 10
+        ar_step10 = str(ar_dir / "ckpt_step10.pt")
+        assert os.path.exists(ar_step10), "NorMuon ckpt_step10.pt not found"
+
+        bd3_dir = tmp_path / "bd3"
+        os.makedirs(bd3_dir, exist_ok=True)
+        args_bd3 = _BASE_ARGS + [
+            "--model", "bd3lm",
+            "--block_len", "16",
+            "--optimizer", "normuon",
+            "--learning_rate", "1.0",
+            "--min_lr", "0.1",
+            "--adam_mult", "0.3",
+            "--matrix_mult", "1.0",
+            "--max_iters", "10",
+            "--resume_from", ar_step10,
+            "--skip_final_checkpoint", "false",
+            "--checkpoint_path", str(bd3_dir / "ckpt.pt"),
+            "--loss_log_path", str(bd3_dir / "loss.pkl"),
+        ]
+        r2 = _run_train(args_bd3)
+        assert r2.returncode == 0, f"NorMuon BD3-LM resume failed:\n{r2.stderr[-1000:]}"
+        assert "Loaded model weights" in r2.stdout
+        _check_basic_training(r2.stdout, min_steps=2)
+
+
+# ===============================================================
+# Test 12: Sample generation
+# ===============================================================
+
+@_skip_climbmix
 class TestCUDAGeneration:
     """Verify sample generation works on CUDA for all families."""
 

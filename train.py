@@ -694,9 +694,16 @@ if __name__ == "__main__":
             )
         optimizer.step()
 
-        if save_interval > 0 and iter > 0 and iter % save_interval == 0:
+        # Checkpoint saving.  Use (iter + 1) so the step number in the
+        # filename equals the number of completed optimizer updates:
+        #   iter=199  → 200 updates done → ckpt_step200.pt
+        #   iter=799  → 800 updates done → ckpt_step800.pt
+        # This ensures max_iters=800 actually produces ckpt_step800.pt
+        # (the loop runs iter 0..799, so iter=800 never occurs).
+        completed_steps = iter + 1
+        if save_interval > 0 and completed_steps % save_interval == 0:
             ckpt = {
-                "iter": iter,
+                "iter": completed_steps,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": loss_val,
@@ -710,10 +717,10 @@ if __name__ == "__main__":
             # Save step-numbered checkpoint (for checkpoint sharing across
             # curriculum variants) AND overwrite the latest checkpoint.
             base, ext = os.path.splitext(checkpoint_path)
-            step_path = f"{base}_step{iter}{ext}"
+            step_path = f"{base}_step{completed_steps}{ext}"
             torch.save(ckpt, step_path)
             torch.save(ckpt, checkpoint_path)
-            print(f"saved checkpoint to {step_path} (and {checkpoint_path}) at step {iter}")
+            print(f"saved checkpoint to {step_path} (and {checkpoint_path}) at step {completed_steps}")
 
         # GC management: Python's cyclic GC causes ~500ms stalls when it
         # scans the autograd graph.  Run a full collection on step 0 (to
