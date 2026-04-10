@@ -237,8 +237,9 @@ group LR than the Muon matrix LR.
    steps. Phase 1 uses `--steps 1000`. This is simpler for quick experiments and
    avoids the FLOP accounting indirection when we're not doing scaling-law fits.
 
-5. **Curriculum focus before IsoFLOP.** Phase 1 runs C0 (4 p_AR variants) and C1
-   with both optimizers at 50M/1000 steps = 10 total runs. IsoFLOP scaling sweeps
+5. **Curriculum + pure-BD3 baseline before IsoFLOP.** Phase 1 runs a pure
+   BD3-LM baseline (`block_len=16`) plus C0 (4 p_AR variants) and C1, all with
+   both optimizers at 50M/1000 steps = 12 total runs. IsoFLOP scaling sweeps
    are deferred to a later phase.
 
 ### Checkpoint sharing & disk-space optimizations
@@ -359,11 +360,11 @@ Step 1 is skipped entirely so re-runs jump straight to the BD3 stages.
 
 ### Next steps
 
-1. Push updated `run_phase1.sh` to both VMs (`git pull`).
-2. Re-run `bash run_phase1.sh adamw` and `bash run_phase1.sh normuon` — AR
-   warmup will be skipped automatically, and the BD3 stages use the
-   `batch_size=32, grad_accum_steps=8` setting.
-3. Commit the resulting `.pkl` loss logs.
+1. Push updated Phase 1 scripts to both VMs (`git pull`).
+2. Re-run `bash run_phase1.sh adamw`, `bash run_phase1.sh normuon`, and the
+   new pure-BD3 baseline script. AR warmup will be skipped automatically, and
+   all BD3 runs use the `batch_size=32, grad_accum_steps=8` setting.
+3. Commit the resulting logs and checkpoints metadata.
 
 ### Disk budget (revised)
 
@@ -378,6 +379,7 @@ With `--save_weights_only true` on all checkpoints (~250 MB each):
 | File | Change |
 |------|--------|
 | `run_phase1.sh` | BD3 stages: `batch_size` 128→32, `grad_accum_steps` 2→8; disabled in-run eval/sampling; train logs every 10 steps; added AR warmup skip guard; `python`→`python3` |
+| `run_phase1_baselines.sh` | New: pure BD3-LM 50M/1000-step baseline runner for `adamw`, `normuon`, or both, with skip-if-complete behavior |
 | `train.py:75-76` | Fixed `--save_weights_only` help text (all checkpoints respect flag) |
 | `.gitignore` | Removed `runs/` and `*.pkl`; kept `*.pt` |
 | `MEMO.md` | Updated `--save_weights_only` description; added this section |

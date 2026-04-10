@@ -12,11 +12,28 @@ Supports both standard (single-stream) and BD3-style (dual-stream) operation:
 The objective/sampler still lives in the per-model files.
 """
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from block_utils import make_bd3_train_mask, make_block_causal_mask, validate_block_len
+try:
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+    FLEX_ATTN_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on local torch build
+    BlockMask = None
+    flex_attention = None
+    FLEX_ATTN_AVAILABLE = False
+
+from block_utils import (
+    make_bd3_train_mask,
+    make_block_causal_mask,
+    make_bd3_train_block_mask,
+    make_block_causal_block_mask,
+    validate_block_len,
+)
 
 
 # ------------------------------------------------------------------
@@ -26,6 +43,15 @@ from block_utils import make_bd3_train_mask, make_block_causal_mask, validate_bl
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def _resolve_bd3_attn_backend():
+    backend = os.getenv("BABYDLM_BD3_ATTN_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "sdpa", "flex"}:
+        raise ValueError(
+            "BABYDLM_BD3_ATTN_BACKEND must be one of: auto, sdpa, flex"
+        )
+    return backend
 
 
 
@@ -73,14 +99,19 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            is_causal=False,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        if FLEX_ATTN_AVAILABLE and BlockMask is not None and isinstance(attn_mask, BlockMask):
+            # FlexAttention gives BD3 a sparse kernel path, but it does not
+            # expose attention-probability dropout like SDPA does.
+            y = flex_attention(q, k, v, block_mask=attn_mask)
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                is_causal=False,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         y = y.transpose(1, 2).contiguous().view(B, Tseq, -1)
         y = self.c_proj(y)
         return self.resid_dropout(y)
@@ -149,6 +180,12 @@ class DiffusionBackbone(nn.Module):
         self.block_size = block_size
         self.block_len = block_len
         self._is_single_block = (block_len == block_size)
+        self.bd3_attn_backend = _resolve_bd3_attn_backend()
+        if self.bd3_attn_backend == "flex" and not FLEX_ATTN_AVAILABLE:
+            raise RuntimeError(
+                "BABYDLM_BD3_ATTN_BACKEND=flex requested, but FlexAttention "
+                "is not available in this torch build"
+            )
 
         self.token_emb = nn.Embedding(vocab_size, n_embd)
         self.emb_dropout = nn.Dropout(dropout)
@@ -181,6 +218,7 @@ class DiffusionBackbone(nn.Module):
         else:
             self.register_buffer("train_attn_mask", None, persistent=False)
             self.register_buffer("sample_attn_mask", None, persistent=False)
+        self._flex_mask_cache = {}
 
         self.blocks = nn.ModuleList(
             [Block(n_embd, n_head, head_dim, dropout) for _ in range(n_layer)]
@@ -209,9 +247,43 @@ class DiffusionBackbone(nn.Module):
             return self.cos_dual[:, :Tseq], self.sin_dual[:, :Tseq]
         return self.cos[:, :Tseq], self.sin[:, :Tseq]
 
-    def _select_attn_mask(self, Tseq: int, dual_stream: bool):
+    def _should_use_flex_attention(self, device: torch.device) -> bool:
+        if self._is_single_block:
+            return False
+        if device.type != "cuda":
+            return False
+        if not FLEX_ATTN_AVAILABLE:
+            return False
+        return self.bd3_attn_backend != "sdpa"
+
+    def _get_flex_attn_mask(self, Tseq: int, dual_stream: bool, device: torch.device):
+        key = (str(device), dual_stream, Tseq)
+        mask = self._flex_mask_cache.get(key)
+        if mask is not None:
+            return mask
+
+        if dual_stream:
+            if Tseq % 2 != 0:
+                raise ValueError(f"dual_stream expects even length, got {Tseq}")
+            mask = make_bd3_train_block_mask(
+                seq_len=Tseq // 2,
+                block_len=self.block_len,
+                device=device,
+            )
+        else:
+            mask = make_block_causal_block_mask(
+                seq_len=Tseq,
+                block_len=self.block_len,
+                device=device,
+            )
+        self._flex_mask_cache[key] = mask
+        return mask
+
+    def _select_attn_mask(self, Tseq: int, dual_stream: bool, device: torch.device):
         if self._is_single_block:
             return None  # full bidirectional — fastest path
+        if self._should_use_flex_attention(device):
+            return self._get_flex_attn_mask(Tseq, dual_stream, device)
         if dual_stream:
             return self.train_attn_mask[:, :, :Tseq, :Tseq]
         return self.sample_attn_mask[:, :, :Tseq, :Tseq]
@@ -225,7 +297,7 @@ class DiffusionBackbone(nn.Module):
         x = norm(x)
 
         cos_sin = self._select_rotary(Tseq, dual_stream)
-        attn_mask = self._select_attn_mask(Tseq, dual_stream)
+        attn_mask = self._select_attn_mask(Tseq, dual_stream, idx.device)
 
         for block in self.blocks:
             x = block(x, cos_sin, attn_mask=attn_mask)

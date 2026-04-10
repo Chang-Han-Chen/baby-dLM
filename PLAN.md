@@ -184,13 +184,14 @@ sweet spot.  Applied to all three families at 50M → `calibrated_normuon.json`.
 
 ## 5  Curriculum experiments (Phase 1)
 
-Phase 1 runs curriculum 0 and curriculum 1 at 50M scale with both optimizer
-families, using a fixed step budget rather than a FLOP budget.
+Phase 1 runs curriculum 0, curriculum 1, and a pure BD3-LM baseline at 50M
+scale with both optimizer families, using a fixed step budget rather than a
+FLOP budget.
 
 **Training scope:**
 - Model size: 50M only
 - Optimizer families: `adamw`, `normuon`
-- Curricula: C0 (sweep p_AR ∈ {0.2, 0.3, 0.5, 0.8}) and C1 (geometric)
+- Runs: pure BD3-LM baseline (`block_len=16`), C0 (sweep p_AR ∈ {0.2, 0.3, 0.5, 0.8}), and C1 (geometric)
 - Total steps per run: 1000, split across stages by `flop_frac`
 - LR schedule: warmup-stable (5% linear warmup, then constant)
 - AR warmup uses `batch_size=128, grad_accum_steps=2` (effective batch 256)
@@ -200,23 +201,27 @@ families, using a fixed step budget rather than a FLOP budget.
   (`eval_interval=0`, `skip_final_eval=true`, `num_final_samples=0`) and logs
   train loss / grad norm every 10 steps
 
-This gives **10 runs** total (5 curricula × 2 optimizers).
+This gives **12 runs** total (6 run types × 2 optimizers).
 
 ### 5.1  Step allocation examples
 
 C0 with p_AR=0.2: 200 AR steps → 800 BD3(16) steps.
 C0 with p_AR=0.8: 800 AR steps → 200 BD3(16) steps.
 C1 (5 equal stages): 200 steps each for AR → BD3(2) → BD3(4) → BD3(8) → BD3(16).
+Pure BD3 baseline: 1000 BD3(16) steps from scratch.
 
 ### 5.2  Execution order
 1. ~~Implement `--optimizer normuon`~~ Done.
 2. ~~Run LR calibration for 50M.~~ Done (§4.1).
 3. ~~Freeze calibrated configs.~~ Done (`calibrated_lrs.json`,
    `calibrated_normuon.json`).
-4. Run curriculum 0 and curriculum 1 for both optimizers at 50M/1000 steps.
-5. Analyze results: compare optimizer families, compare p_AR schedules,
-   compare C0 vs C1.
-6. Decide whether to proceed to IsoFLOP scaling (§5A) or additional curricula.
+4. Run pure BD3-LM baseline for both optimizers at 50M/1000 steps
+   (`run_phase1_baselines.sh`).
+5. Run curriculum 0 and curriculum 1 for both optimizers at 50M/1000 steps
+   (`run_phase1.sh`).
+6. Analyze results: compare optimizer families, compare against the pure BD3
+   baseline, compare p_AR schedules, compare C0 vs C1.
+7. Decide whether to proceed to IsoFLOP scaling (§5A) or additional curricula.
 
 ### 5.3  Metrics
 - Primary: validation BPB (bits per byte) from post-training evaluation of the
@@ -355,3 +360,90 @@ Extend `reproduce.ipynb` (or new notebook) to plot:
   complicated grouped-LR sweep into the later curricula?
 - Curriculum 4 design: consider reverse schedules (large→small block_len),
   or non-monotonic schedules informed by curricula 1–3.
+
+---
+
+## 8  Fast Iteration Infra (brainstorm)
+
+As we collect more systems and recipe ideas (e.g. FlexAttention for BD3-LM,
+EMA, Z-loss, value residual paths, norm scaling, packed QKV, FlashAttention
+variants), the repo should support *fast screening* before ideas graduate into
+the main training stack.
+
+Recommended direction:
+
+- Keep the main training code as the production path.
+- Add a lightweight experiment area such as `prototypes/` or `research/` for
+  ideas that are not yet stable enough to merge into the main path.
+- Use notebooks primarily for analysis / plots / debugging, not as the source
+  of truth for runnable experiments.
+
+### 8.1  Promotion ladder for new ideas
+
+Each idea should move through three stages:
+
+1. **Microbench**
+   - Goal: measure `tokens/s`, step time, peak memory, compile overhead.
+   - Best for: attention kernels, mask representations, packed QKV, fused ops.
+   - Use synthetic data with realistic tensor shapes.
+
+2. **Proxy train**
+   - Goal: measure whether the idea helps optimization on a small but real
+     training run.
+   - Best for: EMA, Z-loss, optimizer tweaks, value residual, norm scaling.
+   - Use a small model (roughly 10M–20M) and short runs before scaling up.
+
+3. **Full-stack smoke**
+   - Goal: check that the idea still helps in the real regime.
+   - Use a very small number of realistic 50M / seq=2048 runs.
+   - Only winners from the proxy stage should reach this step.
+
+### 8.2  Recommended folder split
+
+- `prototypes/bench_attention.py`
+  - Synthetic throughput / memory benchmark for AR, MDLM, BD3-LM attention.
+- `prototypes/run_proxy.py`
+  - Short proxy training harness for architecture / optimizer / recipe ideas.
+- `prototypes/configs/`
+  - Tiny configs for quick experiments.
+- `notebooks/`
+  - Analysis and plotting only.
+- `results/ideas.jsonl` (or similar)
+  - Simple log of idea name, config, metrics, and notes.
+
+### 8.3  Separate systems vs recipe vs model ideas
+
+Not all ideas need the same harness. Keep these buckets distinct:
+
+- **Systems ideas**
+  - FlexAttention, FlashAttention paths, fused ops, mask construction,
+    compile settings.
+- **Recipe ideas**
+  - EMA, Z-loss, schedules, weight decay rules.
+- **Model ideas**
+  - Value residual, layer-wise norm scaling, GQA, other architecture tweaks.
+
+This avoids mixing kernel speed questions with modeling questions too early.
+
+### 8.4  Practical proxy-design notes
+
+- A tiny notebook model with very short sequence length is good for logic
+  debugging, but not always reliable for systems conclusions.
+- Attention kernels can behave very differently at seq=256 vs seq=2048, or
+  for masked vs unmasked attention.
+- Therefore:
+  - use toy shapes for correctness,
+  - use realistic shapes for throughput benchmarking,
+  - and only use 50M-scale runs for finalists.
+
+### 8.5  Target iteration loop
+
+Aim for an idea workflow like:
+
+1. 5-minute correctness smoke test
+2. 15-minute synthetic throughput benchmark
+3. 1–2 hour proxy train
+4. 50M confirmation only for the best ideas
+
+This should make it much cheaper to decide whether a speed or quality idea is
+worth integrating into the production training path.

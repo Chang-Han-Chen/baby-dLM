@@ -5,7 +5,17 @@ Used by backbone.py for constructing the dual-stream training mask
 and the block-causal sampling mask.
 """
 
+from functools import partial
+
 import torch
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    FLEX_ATTN_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on local torch build
+    create_block_mask = None
+    FLEX_ATTN_AVAILABLE = False
 
 
 # ------------------------------------------------------------------
@@ -32,6 +42,28 @@ def num_blocks(block_size: int, block_len: int) -> int:
 # ------------------------------------------------------------------
 
 
+def bd3_train_mask_mod(_batch, _head, q_idx, kv_idx, *, seq_len: int, block_len: int):
+    """
+    Token-level BD3 training mask rule used by both dense SDPA masks and
+    sparse FlexAttention block masks.
+    """
+    q_is_x0 = q_idx >= seq_len
+    kv_is_x0 = kv_idx >= seq_len
+
+    q_block = torch.where(q_is_x0, (q_idx - seq_len) // block_len, q_idx // block_len)
+    kv_block = torch.where(kv_is_x0, (kv_idx - seq_len) // block_len, kv_idx // block_len)
+
+    block_diagonal = (q_block == kv_block) & (q_is_x0 == kv_is_x0)
+    offset_block_causal = (q_block > kv_block) & kv_is_x0 & (~q_is_x0)
+    block_causal = (q_block >= kv_block) & kv_is_x0 & q_is_x0
+    return block_diagonal | offset_block_causal | block_causal
+
+
+def block_causal_mask_mod(_batch, _head, q_idx, kv_idx, *, block_len: int):
+    """Token-level one-stream block-causal rule used during BD3 sampling."""
+    return (q_idx // block_len) >= (kv_idx // block_len)
+
+
 def make_bd3_train_mask(seq_len: int, block_len: int, device=None) -> torch.Tensor:
     """
     Full 2L x 2L BD3-LM training mask for x_t ⊕ x_0.
@@ -51,20 +83,14 @@ def make_bd3_train_mask(seq_len: int, block_len: int, device=None) -> torch.Tens
     """
     validate_block_len(seq_len, block_len)
     idx = torch.arange(2 * seq_len, device=device)
-    q_idx = idx[:, None]
-    k_idx = idx[None, :]
-
-    q_is_x0 = q_idx >= seq_len
-    k_is_x0 = k_idx >= seq_len
-
-    q_block = torch.where(q_is_x0, (q_idx - seq_len) // block_len, q_idx // block_len)
-    k_block = torch.where(k_is_x0, (k_idx - seq_len) // block_len, k_idx // block_len)
-
-    m_bd = (q_block == k_block) & (~q_is_x0) & (~k_is_x0)
-    m_obc = (~q_is_x0) & k_is_x0 & (k_block < q_block)
-    m_bc = q_is_x0 & k_is_x0 & (k_block <= q_block)
-
-    mask = m_bd | m_obc | m_bc
+    mask = bd3_train_mask_mod(
+        None,
+        None,
+        idx[:, None],
+        idx[None, :],
+        seq_len=seq_len,
+        block_len=block_len,
+    )
     return mask[None, None, :, :]
 
 
@@ -78,10 +104,56 @@ def make_block_causal_mask(seq_len: int, block_len: int, device=None) -> torch.T
     """
     validate_block_len(seq_len, block_len)
     pos = torch.arange(seq_len, device=device)
-    q_block = pos[:, None] // block_len
-    k_block = pos[None, :] // block_len
-    mask = k_block <= q_block
+    mask = block_causal_mask_mod(
+        None,
+        None,
+        pos[:, None],
+        pos[None, :],
+        block_len=block_len,
+    )
     return mask[None, None, :, :]
+
+
+def _normalize_mask_device(device) -> str:
+    if device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return str(device)
+
+
+def make_bd3_train_block_mask(seq_len: int, block_len: int, device=None):
+    """
+    Sparse FlexAttention block mask for dual-stream BD3 training.
+    """
+    if not FLEX_ATTN_AVAILABLE:
+        raise RuntimeError("FlexAttention is not available in this torch build")
+    validate_block_len(seq_len, block_len)
+    return create_block_mask(
+        partial(bd3_train_mask_mod, seq_len=seq_len, block_len=block_len),
+        B=None,
+        H=None,
+        Q_LEN=2 * seq_len,
+        KV_LEN=2 * seq_len,
+        device=_normalize_mask_device(device),
+        BLOCK_SIZE=block_len,
+    )
+
+
+def make_block_causal_block_mask(seq_len: int, block_len: int, device=None):
+    """
+    Sparse FlexAttention block mask for one-stream BD3 sampling.
+    """
+    if not FLEX_ATTN_AVAILABLE:
+        raise RuntimeError("FlexAttention is not available in this torch build")
+    validate_block_len(seq_len, block_len)
+    return create_block_mask(
+        partial(block_causal_mask_mod, block_len=block_len),
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=_normalize_mask_device(device),
+        BLOCK_SIZE=block_len,
+    )
 
 
 # ------------------------------------------------------------------

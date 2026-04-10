@@ -1,10 +1,16 @@
+import pytest
 import torch
 
 from block_utils import (
+    FLEX_ATTN_AVAILABLE,
+    bd3_train_mask_mod,
     bd3_train_mask_special_cases_ok,
+    block_causal_mask_mod,
     block_causal_equals_causal_when_block_len_is_one,
     make_bd3_train_mask,
+    make_bd3_train_block_mask,
     make_block_causal_mask,
+    make_block_causal_block_mask,
 )
 
 
@@ -42,12 +48,43 @@ def test_training_mask_matches_upstream_formula():
         assert torch.equal(local, upstream)
 
 
+def test_training_mask_mod_matches_dense_builder():
+    seq_len = 12
+    block_len = 3
+    idx = torch.arange(2 * seq_len)
+    mod_mask = bd3_train_mask_mod(
+        None,
+        None,
+        idx[:, None],
+        idx[None, :],
+        seq_len=seq_len,
+        block_len=block_len,
+    )
+    dense_mask = make_bd3_train_mask(seq_len, block_len)[0, 0]
+    assert torch.equal(mod_mask, dense_mask)
+
+
 def test_sampling_mask_matches_x0_stream_restriction():
     seq_len = 12
     block_len = 3
     train_mask = make_bd3_train_mask(seq_len, block_len)[0, 0]
     sample_mask = make_block_causal_mask(seq_len, block_len)[0, 0]
     assert torch.equal(train_mask[seq_len:, seq_len:], sample_mask)
+
+
+def test_sampling_mask_mod_matches_dense_builder():
+    seq_len = 12
+    block_len = 3
+    pos = torch.arange(seq_len)
+    mod_mask = block_causal_mask_mod(
+        None,
+        None,
+        pos[:, None],
+        pos[None, :],
+        block_len=block_len,
+    )
+    dense_mask = make_block_causal_mask(seq_len, block_len)[0, 0]
+    assert torch.equal(mod_mask, dense_mask)
 
 
 def test_training_mask_structure():
@@ -71,3 +108,15 @@ def test_training_mask_structure():
     assert mask[seq_len + 4, seq_len + 0]
     assert mask[seq_len + 4, seq_len + 4]
     assert not mask[seq_len + 4, seq_len + 6]
+
+
+@pytest.mark.skipif(not FLEX_ATTN_AVAILABLE, reason="FlexAttention not available")
+def test_flex_training_block_mask_shape():
+    block_mask = make_bd3_train_block_mask(seq_len=8, block_len=2, device="cpu")
+    assert block_mask.shape == (1, 1, 16, 16)
+
+
+@pytest.mark.skipif(not FLEX_ATTN_AVAILABLE, reason="FlexAttention not available")
+def test_flex_sampling_block_mask_shape():
+    block_mask = make_block_causal_block_mask(seq_len=8, block_len=2, device="cpu")
+    assert block_mask.shape == (1, 1, 8, 8)
