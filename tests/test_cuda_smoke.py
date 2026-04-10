@@ -161,6 +161,30 @@ _CLIMBMIX_BASE_ARGS = [
 ]
 _BASE_ARGS = _CLIMBMIX_BASE_ARGS
 
+# Tiny model for pre-flight flow tests — verifies checkpoint plumbing without
+# filling the disk.  Full 50M config writes ~750 MB per checkpoint; this tiny
+# config writes ~5 MB.  n_head must divide n_embd.
+_PREFLIGHT_ARGS = [
+    "--data", "climbmix",
+    "--n_embd", "64", "--n_layer", "2", "--n_head", "4",
+    "--batch_size", "4",
+    "--grad_accum_steps", "1",
+    "--block_size", "256",
+    "--eval_interval", "9999",
+    "--eval_iters", "1",
+    "--warmup_iters", "2",
+    "--save_interval", "0",
+    "--num_final_samples", "0",
+    "--gpt2_eval_interval", "0",
+    "--gpt2_eval_samples", "0",
+    "--sample_interval", "0",
+    "--skip_final_eval", "true",
+    "--skip_final_checkpoint", "true",
+    "--warmup_stable", "true",
+    "--use_compile", "false",
+    "--save_weights_only", "true",
+]
+
 
 # ===============================================================
 # Test 1: Basic CUDA training for all 3 model families x AdamW
@@ -696,7 +720,7 @@ class TestPhase1Preflight:
     def test_step_numbered_checkpoints_produced(self, tmp_path):
         """AR warmup produces ckpt_step{N}.pt at the correct steps."""
         ckpt_path = str(tmp_path / "ckpt.pt")
-        args = _BASE_ARGS + [
+        args = _PREFLIGHT_ARGS + [
             "--model", "ar",
             "--optimizer", "adamw",
             "--learning_rate", "1e-3",
@@ -741,7 +765,7 @@ class TestPhase1Preflight:
         os.makedirs(tmp_path / "ar", exist_ok=True)
 
         # AR warmup
-        args_ar = _BASE_ARGS + [
+        args_ar = _PREFLIGHT_ARGS + [
             "--model", "ar",
             "--optimizer", "adamw",
             "--learning_rate", "1e-3",
@@ -761,7 +785,7 @@ class TestPhase1Preflight:
 
         bd3_dir = tmp_path / "c0_bd3"
         os.makedirs(bd3_dir, exist_ok=True)
-        args_bd3 = _BASE_ARGS + [
+        args_bd3 = _PREFLIGHT_ARGS + [
             "--model", "bd3lm",
             "--block_len", "16",
             "--optimizer", "adamw",
@@ -787,7 +811,7 @@ class TestPhase1Preflight:
         # Stage 0: AR (10 steps)
         ar_dir = tmp_path / "ar"
         os.makedirs(ar_dir, exist_ok=True)
-        args_ar = _BASE_ARGS + [
+        args_ar = _PREFLIGHT_ARGS + [
             "--model", "ar",
             "--optimizer", "adamw",
             "--learning_rate", "1e-3",
@@ -803,7 +827,7 @@ class TestPhase1Preflight:
         # Stage 1: BD3(bl=2) from AR checkpoint
         bl2_dir = tmp_path / "bl2"
         os.makedirs(bl2_dir, exist_ok=True)
-        args_bl2 = _BASE_ARGS + [
+        args_bl2 = _PREFLIGHT_ARGS + [
             "--model", "bd3lm",
             "--block_len", "2",
             "--optimizer", "adamw",
@@ -822,7 +846,7 @@ class TestPhase1Preflight:
         # Stage 2: BD3(bl=4) from bl=2 checkpoint
         bl4_dir = tmp_path / "bl4"
         os.makedirs(bl4_dir, exist_ok=True)
-        args_bl4 = _BASE_ARGS + [
+        args_bl4 = _PREFLIGHT_ARGS + [
             "--model", "bd3lm",
             "--block_len", "4",
             "--optimizer", "adamw",
@@ -844,7 +868,7 @@ class TestPhase1Preflight:
         ar_dir = tmp_path / "ar"
         os.makedirs(ar_dir, exist_ok=True)
 
-        args_ar = _BASE_ARGS + [
+        args_ar = _PREFLIGHT_ARGS + [
             "--model", "ar",
             "--optimizer", "normuon",
             "--learning_rate", "1.0",
@@ -866,7 +890,7 @@ class TestPhase1Preflight:
 
         bd3_dir = tmp_path / "bd3"
         os.makedirs(bd3_dir, exist_ok=True)
-        args_bd3 = _BASE_ARGS + [
+        args_bd3 = _PREFLIGHT_ARGS + [
             "--model", "bd3lm",
             "--block_len", "16",
             "--optimizer", "normuon",
