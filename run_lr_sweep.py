@@ -301,6 +301,7 @@ def run_single(
         skip_final_eval=True,
         skip_final_checkpoint=True,
         eval_interval=ec.LR_SWEEP_STEPS + 1,
+        train_log_interval=10,
         save_interval=0,
         num_final_samples=0,
         gpt2_eval_interval=0,
@@ -348,6 +349,8 @@ def run_single(
         aborted = False
         for line in proc.stdout:
             stdout_lines.append(line)
+            if line.startswith("step "):
+                _tprint(f"    {label} | {line.rstrip()}")
             if _should_abort_line(line):
                 aborted = True
                 _tprint(f"  ABORT  {label}  (diverged: {line.strip()})")

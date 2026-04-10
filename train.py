@@ -58,6 +58,8 @@ parser.add_argument("--grad_accum_steps", type=int, default=1,
                          "bs=256 at micro-batch=128.")
 parser.add_argument("--max_iters", type=int, default=4000)
 parser.add_argument("--eval_interval", type=int, default=300)
+parser.add_argument("--train_log_interval", type=int, default=100,
+                    help="How often to print train loss/grad norm progress lines")
 parser.add_argument("--warmup_iters", type=int, default=100)
 parser.add_argument("--learning_rate", type=float, default=3e-3)
 parser.add_argument("--min_lr", type=float, default=3e-4)
@@ -150,6 +152,7 @@ block_size = args.block_size  # may be overridden by climbmix below
 # block_len is resolved after data source sets final block_size
 max_iters = args.max_iters
 eval_interval = args.eval_interval
+train_log_interval = args.train_log_interval
 warmup_iters = args.warmup_iters
 learning_rate = args.learning_rate
 min_lr = args.min_lr
@@ -718,7 +721,7 @@ if __name__ == "__main__":
         elif (iter + 1) % 5000 == 0:
             gc.collect()
 
-        if iter % min(100, eval_interval) == 0 or iter == max_iters - 1:
+        if iter % max(1, min(train_log_interval, eval_interval)) == 0 or iter == max_iters - 1:
             current_token_epoch = token_epochs_from_steps(iter, num_train_tokens)
             print(
                 f"step {iter} | tok_epoch {current_token_epoch:.2f} | "
