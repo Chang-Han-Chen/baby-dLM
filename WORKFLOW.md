@@ -11,6 +11,8 @@ Three model families (AR, MDLM, BD3-LM), two optimizers (AdamW, NorMuon), ClimbM
 
 **Software:**
 ```bash
+# Torch must be installed from the cu126 index separately (see requirements.txt).
+pip install torch --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
 

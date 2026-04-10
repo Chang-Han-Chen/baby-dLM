@@ -285,9 +285,12 @@ resume flows work; NorMuon checkpoint sharing works.
 
 ### CUDA 12.7 compatibility (requirements.txt)
 
-Added `--extra-index-url https://download.pytorch.org/whl/cu126` so pip pulls
-the CUDA 12.6 wheel (compatible with driver ≤12.7) instead of defaulting to
-CUDA 13.0 which the VM driver can't load.
+Removed torch from `requirements.txt` entirely. pip cannot scope an index to a
+single package — `--extra-index-url` and even `--index-url` still let pip prefer
+a higher-versioned CUDA 13.0 wheel from PyPI. The install procedure is now
+two steps: `pip install torch --index-url https://download.pytorch.org/whl/cu126`
+first, then `pip install -r requirements.txt` for everything else. This
+guarantees the cu126 build on driver 565.77 (CUDA ≤12.7).
 
 ### Files changed
 
@@ -299,7 +302,7 @@ CUDA 13.0 which the VM driver can't load.
 | `train.py` | Added `--save_steps`, `--save_weights_only` flags; fixed checkpoint step numbering (P1+P2); metadata uses `completed_steps` |
 | `run_phase1.sh` | Created: shared-AR-warmup + C0/C1 continuation script, parameterized by optimizer |
 | `tests/test_cuda_smoke.py` | Added `TestPhase1Preflight` (4 tests) |
-| `requirements.txt` | Added `--extra-index-url` for CUDA 12.6 wheels |
+| `requirements.txt` | Removed torch; two-step install to guarantee cu126 wheel |
 | `PLAN.md` | Added §4.1 (calibration results), rewrote §5 (curriculum experiments), deferred IsoFLOP to §5A |
 | `WORKFLOW.md` | Updated LR sweep sections as complete, added `--steps 1000` commands, fixed LR_SWEEP_STEPS typo |
 
