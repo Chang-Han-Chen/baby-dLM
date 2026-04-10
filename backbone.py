@@ -114,6 +114,11 @@ class MultiHeadAttention(nn.Module):
         if FLEX_ATTN_AVAILABLE and BlockMask is not None and isinstance(attn_mask, BlockMask):
             # FlexAttention gives BD3 a sparse kernel path, but it does not
             # expose attention-probability dropout like SDPA does.
+            # flex_attention requires matching dtypes.  Under autocast, q/k
+            # are promoted to float32 by rotary_emb (float32 cos/sin buffers)
+            # while v stays in bfloat16.  Cast v to match.
+            if v.dtype != q.dtype:
+                v = v.to(q.dtype)
             y = fused_flex_attention(q, k, v, attn_mask)
         else:
             y = F.scaled_dot_product_attention(
