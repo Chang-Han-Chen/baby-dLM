@@ -6,15 +6,14 @@ train.py, all three model families, both optimizers, ClimbMix data loading,
 torch.compile, checkpointing, and resume all work correctly on CUDA.
 
 Each test runs a very short training loop (≤30 steps) at the smallest
-ClimbMix size (50M) so total wall-time is ~2-5 minutes for the whole file.
+size so total wall-time is ~2-5 minutes for the whole file.
 
 Usage:
     pytest tests/test_cuda_smoke.py -v --tb=short
 
 Requirements:
     - CUDA-capable GPU with ≥16 GB VRAM
-    - ClimbMix data downloaded (at least 1 train shard + val shard)
-      Run `python prepare.py` first if you haven't.
+    - For ClimbMix-specific tests: run `python prepare.py` first
 """
 
 import json
@@ -45,7 +44,7 @@ _STEP_RE = re.compile(
 
 def _run_train(args: list, timeout: int = 300) -> subprocess.CompletedProcess:
     """Run train.py with the given extra args, returning CompletedProcess."""
-    cmd = [PYTHON, "train.py"] + args
+    cmd = [PYTHON, "-u", "train.py"] + args
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -103,12 +102,61 @@ pytestmark = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------
-# Common args for short ClimbMix runs on 50M
+# Check whether ClimbMix data has been downloaded
 # ---------------------------------------------------------------
 
-# We use a small batch_size (16) and grad_accum=1 to keep VRAM modest
-# during smoke tests.  The real sweep uses batch=128, accum=2 (eff. 256).
+_CLIMBMIX_TOKENIZER = os.path.join(
+    os.path.expanduser("~"), ".cache", "autoresearch", "tokenizer", "tokenizer.pkl"
+)
+_CLIMBMIX_DATA_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "autoresearch", "data"
+)
+
+def _climbmix_available():
+    """Return True if ClimbMix tokenizer + at least 1 shard exist."""
+    if not os.path.isfile(_CLIMBMIX_TOKENIZER):
+        return False
+    if not os.path.isdir(_CLIMBMIX_DATA_DIR):
+        return False
+    parquet_files = [f for f in os.listdir(_CLIMBMIX_DATA_DIR) if f.endswith(".parquet")]
+    return len(parquet_files) >= 2  # need at least 1 train shard + 1 val shard
+
+_HAS_CLIMBMIX = _climbmix_available()
+_skip_climbmix = pytest.mark.skipif(
+    not _HAS_CLIMBMIX,
+    reason="ClimbMix data not available — run `python prepare.py` first",
+)
+
+
+# ---------------------------------------------------------------
+# Common args for short runs — use 'tiny' data (no download needed)
+# ---------------------------------------------------------------
+
+# These test CUDA correctness of the training code, NOT ClimbMix data.
+# 'tiny' mode uses data.txt (char-level Shakespeare, ~10KB, always in repo).
 _BASE_ARGS = [
+    "--data", "tiny",
+    "--n_embd", "256", "--n_layer", "6", "--n_head", "4",
+    "--batch_size", "16",
+    "--grad_accum_steps", "1",
+    "--block_size", "256",
+    "--max_iters", "30",
+    "--eval_interval", "10",
+    "--eval_iters", "2",
+    "--warmup_iters", "5",
+    "--save_interval", "0",
+    "--num_final_samples", "0",
+    "--gpt2_eval_interval", "0",
+    "--gpt2_eval_samples", "0",
+    "--sample_interval", "0",
+    "--skip_final_eval", "false",
+    "--skip_final_checkpoint", "true",
+    "--warmup_stable", "true",
+    "--use_compile", "false",  # torch.compile tested separately
+]
+
+# ClimbMix-specific base args (50M architecture, full seq_len=2048)
+_CLIMBMIX_BASE_ARGS = [
     "--data", "climbmix",
     "--n_embd", "512", "--n_layer", "16", "--n_head", "8",
     "--batch_size", "16",
@@ -126,12 +174,12 @@ _BASE_ARGS = [
     "--skip_final_eval", "false",
     "--skip_final_checkpoint", "true",
     "--warmup_stable", "true",
-    "--use_compile", "false",  # torch.compile tested separately
+    "--use_compile", "false",
 ]
 
 
 # ===============================================================
-# Test 1: Basic CUDA training for all 3 model families × AdamW
+# Test 1: Basic CUDA training for all 3 model families x AdamW
 # ===============================================================
 
 class TestCUDATraining:
@@ -346,9 +394,10 @@ class TestCheckpointResume:
 
 
 # ===============================================================
-# Test 5: ClimbMix data loading works
+# Test 5: ClimbMix data loading works (REQUIRES prepare.py)
 # ===============================================================
 
+@_skip_climbmix
 class TestClimbMixData:
     """Verify ClimbMix data pipeline on CUDA."""
 
@@ -356,32 +405,47 @@ class TestClimbMixData:
         """Directly test prepare.py's dataloader without training."""
         import torch
         sys.path.insert(0, REPO_ROOT)
-        from prepare import Tokenizer, make_dataloader, DATA_DIR
+        from prepare import Tokenizer, make_dataloader
 
-        # Check that data is present
-        tok = Tokenizer.from_directory(DATA_DIR)
+        tok = Tokenizer.from_directory()
         assert tok.vocab_size == 8192, f"Unexpected vocab_size: {tok.vocab_size}"
         assert tok.mask_token_id is not None, "mask_token_id not set"
 
-        # Get a batch
-        dl = make_dataloader(tok, batch_size=4, seq_len=2048, split="train")
-        batch = next(iter(dl))
-        assert batch.shape == (4, 2048), f"Unexpected batch shape: {batch.shape}"
-        assert batch.dtype == torch.long
+        # Get a batch (B=4, T=2048)
+        dl = make_dataloader(tok, B=4, T=2048, split="train")
+        inputs, targets, epoch = next(dl)
+        assert inputs.shape == (4, 2048), f"Unexpected inputs shape: {inputs.shape}"
+        assert inputs.dtype == torch.long
 
         # Verify tokens are in valid range
-        assert batch.min() >= 0
-        assert batch.max() < 8192
+        assert inputs.min() >= 0
+        assert inputs.max() < 8192
 
     def test_val_data_loads(self):
         """Verify the pinned validation shard loads."""
         sys.path.insert(0, REPO_ROOT)
-        from prepare import Tokenizer, make_dataloader, DATA_DIR
+        from prepare import Tokenizer, make_dataloader
 
-        tok = Tokenizer.from_directory(DATA_DIR)
-        dl = make_dataloader(tok, batch_size=4, seq_len=2048, split="val")
-        batch = next(iter(dl))
-        assert batch.shape == (4, 2048)
+        tok = Tokenizer.from_directory()
+        dl = make_dataloader(tok, B=4, T=2048, split="val")
+        inputs, targets, epoch = next(dl)
+        assert inputs.shape == (4, 2048)
+
+    def test_climbmix_training_runs(self, tmp_path):
+        """Full end-to-end: 50M model trains on real ClimbMix data."""
+        args = _CLIMBMIX_BASE_ARGS + [
+            "--model", "ar",
+            "--optimizer", "adamw",
+            "--learning_rate", "1e-3",
+            "--min_lr", "1e-4",
+            "--max_iters", "10",
+            "--eval_interval", "10",
+            "--checkpoint_path", str(tmp_path / "ckpt.pt"),
+            "--loss_log_path", str(tmp_path / "loss.pkl"),
+        ]
+        result = _run_train(args)
+        assert result.returncode == 0, f"ClimbMix AR training failed:\n{result.stderr[-1000:]}"
+        _check_basic_training(result.stdout, min_steps=2)
 
 
 # ===============================================================
@@ -438,9 +502,10 @@ class TestBFloat16:
 
 
 # ===============================================================
-# Test 8: Full batch_size=128 fits in VRAM (memory test)
+# Test 8: Full batch_size=128 fits in VRAM (REQUIRES ClimbMix)
 # ===============================================================
 
+@_skip_climbmix
 class TestVRAMFit:
     """Verify production config (micro-batch=128, grad_accum=2, eff. 256) fits."""
 
@@ -475,7 +540,7 @@ class TestVRAMFit:
         ] + extra
         result = _run_train(args, timeout=300)
         assert result.returncode == 0, (
-            f"{model} OOM at batch=128×accum=2:\n{result.stderr[-1000:]}"
+            f"{model} OOM at batch=128*accum=2:\n{result.stderr[-1000:]}"
         )
 
 

@@ -13,9 +13,6 @@ import math
 import argparse
 import pickle
 from multiprocessing import Pool
-import requests
-import pyarrow.parquet as pq
-import rustbpe
 import tiktoken
 import torch
 # ---------------------------------------------------------------------------
@@ -39,11 +36,47 @@ VOCAB_SIZE = 8192
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
+MASK_TOKEN = "<|reserved_1|>"
+
+
+def _require_requests():
+    try:
+        import requests
+    except ImportError as exc:
+        raise ImportError(
+            "requests is required to download ClimbMix shards. "
+            "Install runtime/download dependencies from requirements.txt."
+        ) from exc
+    return requests
+
+
+def _require_pyarrow_parquet():
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError(
+            "pyarrow is required to read ClimbMix parquet shards. "
+            "Install runtime/download dependencies from requirements.txt."
+        ) from exc
+    return pq
+
+
+def _require_rustbpe():
+    try:
+        import rustbpe
+    except ImportError as exc:
+        raise ImportError(
+            "rustbpe is required only for tokenizer training. "
+            "If you already ran prepare.py elsewhere, runtime training can proceed "
+            "without it once this module is imported."
+        ) from exc
+    return rustbpe
 # ---------------------------------------------------------------------------
 # Data download
 # ---------------------------------------------------------------------------
 def download_single_shard(index):
     """Download one parquet shard with retries. Returns True on success."""
+    requests = _require_requests()
     filename = f"shard_{index:05d}.parquet"
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
@@ -101,6 +134,7 @@ def list_parquet_files():
     return [os.path.join(DATA_DIR, f) for f in files]
 def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
     """Yield documents from training split (all shards except pinned val shard)."""
+    pq = _require_pyarrow_parquet()
     parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
     nchars = 0
     for filepath in parquet_paths:
@@ -115,6 +149,7 @@ def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
                     return
 def train_tokenizer():
     """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
+    rustbpe = _require_rustbpe()
     tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
     token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
     if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
@@ -173,12 +208,44 @@ class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
     def __init__(self, enc):
         self.enc = enc
+        self.vocab_size = enc.n_vocab
         self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+        self.mask_token_id = enc.encode_single_token(MASK_TOKEN)
+
     @classmethod
     def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
+        search_dirs = []
+        if tokenizer_dir is None:
+            tokenizer_dir = TOKENIZER_DIR
+        tokenizer_dir = os.path.expanduser(tokenizer_dir)
+        search_dirs.extend([
+            tokenizer_dir,
+            os.path.join(tokenizer_dir, "tokenizer"),
+            os.path.join(os.path.dirname(tokenizer_dir), "tokenizer"),
+            TOKENIZER_DIR,
+        ])
+
+        seen = set()
+        tokenizer_pkl = None
+        for candidate in search_dirs:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidate_pkl = os.path.join(candidate, "tokenizer.pkl")
+            if os.path.exists(candidate_pkl):
+                tokenizer_pkl = candidate_pkl
+                break
+
+        if tokenizer_pkl is None:
+            raise FileNotFoundError(
+                "Could not find tokenizer.pkl. Looked in: "
+                + ", ".join(search_dirs)
+            )
+
+        with open(tokenizer_pkl, "rb") as f:
             enc = pickle.load(f)
         return cls(enc)
+
     def get_vocab_size(self):
         return self.enc.n_vocab
     def get_bos_token_id(self):
@@ -206,6 +273,7 @@ def get_token_bytes(device="cpu"):
         return torch.load(f, map_location=device)
 def _document_batches(split, tokenizer_batch_size=128):
     """Infinite iterator over document batches from parquet files."""
+    pq = _require_pyarrow_parquet()
     parquet_paths = list_parquet_files()
     assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
     val_path = os.path.join(DATA_DIR, VAL_FILENAME)
@@ -224,13 +292,37 @@ def _document_batches(split, tokenizer_batch_size=128):
                 for i in range(0, len(batch), tokenizer_batch_size):
                     yield batch[i:i+tokenizer_batch_size], epoch
         epoch += 1
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(
+    tokenizer,
+    B=None,
+    T=None,
+    split=None,
+    buffer_size=1000,
+    *,
+    batch_size=None,
+    seq_len=None,
+    return_metadata=None,
+):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
     When no document fits remaining space, crops shortest doc to fill exactly.
     100% utilization (no padding).
     """
+    using_legacy_kwargs = False
+    if B is None and batch_size is not None:
+        B = batch_size
+        using_legacy_kwargs = True
+    if T is None and seq_len is not None:
+        T = seq_len
+        using_legacy_kwargs = True
+    if split is None:
+        raise ValueError("split must be provided")
+    if B is None or T is None:
+        raise ValueError("batch size and sequence length must be provided")
+    if return_metadata is None:
+        return_metadata = not using_legacy_kwargs
+
     assert split in ["train", "val"]
     row_capacity = T + 1
     batches = _document_batches(split)
@@ -278,7 +370,10 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
         gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+        if return_metadata:
+            yield inputs, targets, epoch
+        else:
+            yield inputs
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
