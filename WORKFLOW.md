@@ -33,37 +33,34 @@ Smoke tests train directly on ClimbMix and skip automatically if `prepare.py` ha
 
 Each sweep currently runs 200-step warmup-stable training (5% linear warmup, then constant LR). The sweep script runs candidates in parallel, auto-detecting how many fit in VRAM, and early-aborts diverged runs.
 
-### AdamW Sweeps (1D grid: 5 LRs per combo)
+### AdamW Sweeps — COMPLETED (50M only)
 
-AR sweeps over `[1e-4, 3e-4, 1e-3, 3e-3, 1e-2]`. MDLM and BD3-LM sweep `[3e-4, 1e-3, 3e-3, 1e-2, 3e-2]`.
+**Decision:** Use LR=1e-3 for all three model families at 50M scale, based on the
+AR sweep result (loss=4.507 at 1e-3, cleanly optimal across the 5-point grid).
+98M and 170M sweeps are deferred — all Phase 1 experiments run at 50M only.
+
+The shared LR is saved in `calibrated_lrs.json` for AR, MDLM, and BD3-LM at 50M.
 
 ```bash
-# All 3 model families x 3 sizes = 9 sweeps
-python run_lr_sweep.py --optimizer adamw --model ar    --size 50M
-python run_lr_sweep.py --optimizer adamw --model ar    --size 98M
-python run_lr_sweep.py --optimizer adamw --model ar    --size 170M
-python run_lr_sweep.py --optimizer adamw --model mdlm  --size 50M
-python run_lr_sweep.py --optimizer adamw --model mdlm  --size 98M
-python run_lr_sweep.py --optimizer adamw --model mdlm  --size 170M
-python run_lr_sweep.py --optimizer adamw --model bd3lm --size 50M
-python run_lr_sweep.py --optimizer adamw --model bd3lm --size 98M
-python run_lr_sweep.py --optimizer adamw --model bd3lm --size 170M
+# Only the AR sweep was actually run; MDLM and BD3-LM inherit the same LR.
+python run_lr_sweep.py --optimizer adamw --model ar    --size 50M   # DONE → 1e-3
+# python run_lr_sweep.py --optimizer adamw --model mdlm  --size 50M  # skipped, using 1e-3
+# python run_lr_sweep.py --optimizer adamw --model bd3lm --size 50M  # skipped, using 1e-3
 ```
 
-### NorMuon Sweeps (2D grid: 3x3 = 9 combos per model/size)
+### NorMuon Sweeps — COMPLETED (50M only)
 
-Sweeps over `adam_mult x matrix_mult`, both in `[0.3, 1.0, 3.0]`. `adam_mult` scales embedding/unembedding/scalar LRs; `matrix_mult` scales the Muon matrix LR.
+**Decision:** Use `adam_mult=0.3, matrix_mult=1.0` for all three model families at 50M,
+based on the AR sweep (best loss=5.109 from the 3×3 grid). The pattern shows lower
+`adam_mult` is consistently better, and `matrix_mult=1.0` is the sweet spot.
+
+The shared config is saved in `calibrated_normuon.json` for AR, MDLM, and BD3-LM at 50M.
 
 ```bash
-python run_lr_sweep.py --optimizer normuon --model ar    --size 50M
-python run_lr_sweep.py --optimizer normuon --model ar    --size 98M
-python run_lr_sweep.py --optimizer normuon --model ar    --size 170M
-python run_lr_sweep.py --optimizer normuon --model mdlm  --size 50M
-python run_lr_sweep.py --optimizer normuon --model mdlm  --size 98M
-python run_lr_sweep.py --optimizer normuon --model mdlm  --size 170M
-python run_lr_sweep.py --optimizer normuon --model bd3lm --size 50M
-python run_lr_sweep.py --optimizer normuon --model bd3lm --size 98M
-python run_lr_sweep.py --optimizer normuon --model bd3lm --size 170M
+# Only the AR sweep was actually run; MDLM and BD3-LM inherit the same config.
+python run_lr_sweep.py --optimizer normuon --model ar    --size 50M   # DONE → (0.3, 1.0)
+# python run_lr_sweep.py --optimizer normuon --model mdlm  --size 50M  # skipped
+# python run_lr_sweep.py --optimizer normuon --model bd3lm --size 50M  # skipped
 ```
 
 ### Useful flags
@@ -111,28 +108,34 @@ calibrated_normuon.json    # auto-selected NorMuon configs
 
 Step counts are automatically computed from the budget, model family (AR/MDLM use 6N FLOP multiplier, BD3-LM uses 12N due to dual-stream), and effective batch size (256 tokens/step = 128 micro-batch x 2 grad_accum x 2048 seq_len = 524,288 tokens/step).
 
-### Phase 1: Baselines + Curricula 0-1 (both optimizers)
+### Phase 1: Curricula 0-1 at 50M (both optimizers, 1000 steps)
 
 ```bash
-# Baselines (pure single-family training for full budget)
-python run_isoflop.py --curriculum baseline_ar       --budget 1e18 --optimizer adamw
-python run_isoflop.py --curriculum baseline_mdlm     --budget 1e18 --optimizer adamw
-python run_isoflop.py --curriculum baseline_bd3lm_16 --budget 1e18 --optimizer adamw
-# ... repeat for all 4 budgets and both optimizers
+# Curriculum 0: AR -> BD3-LM(16), sweep p_AR — AdamW
+python run_curriculum.py --curriculum c0_plain_p20 --size 50M --steps 1000 --optimizer adamw
+python run_curriculum.py --curriculum c0_plain_p30 --size 50M --steps 1000 --optimizer adamw
+python run_curriculum.py --curriculum c0_plain_p50 --size 50M --steps 1000 --optimizer adamw
+python run_curriculum.py --curriculum c0_plain_p80 --size 50M --steps 1000 --optimizer adamw
 
-# Curriculum 0: AR -> BD3-LM(16), sweep p_AR
-python run_curriculum.py --curriculum c0_plain_p20 --size 50M --budget 1e18 --optimizer adamw
-python run_curriculum.py --curriculum c0_plain_p30 --size 50M --budget 1e18 --optimizer adamw
-python run_curriculum.py --curriculum c0_plain_p50 --size 50M --budget 1e18 --optimizer adamw
-python run_curriculum.py --curriculum c0_plain_p80 --size 50M --budget 1e18 --optimizer adamw
+# Curriculum 1: Geometric doubling AR -> BD3(2) -> BD3(4) -> BD3(8) -> BD3(16) — AdamW
+python run_curriculum.py --curriculum c1_geometric --size 50M --steps 1000 --optimizer adamw
 
-# Curriculum 1: Geometric doubling AR -> BD3(2) -> BD3(4) -> BD3(8) -> BD3(16)
-python run_curriculum.py --curriculum c1_geometric --size 50M --budget 1e18 --optimizer adamw
+# Same 5 runs with NorMuon
+python run_curriculum.py --curriculum c0_plain_p20 --size 50M --steps 1000 --optimizer normuon
+python run_curriculum.py --curriculum c0_plain_p30 --size 50M --steps 1000 --optimizer normuon
+python run_curriculum.py --curriculum c0_plain_p50 --size 50M --steps 1000 --optimizer normuon
+python run_curriculum.py --curriculum c0_plain_p80 --size 50M --steps 1000 --optimizer normuon
+python run_curriculum.py --curriculum c1_geometric --size 50M --steps 1000 --optimizer normuon
 ```
+
+The `--steps 1000` flag splits 1000 total steps across stages by `flop_frac`.
+For example, C1 (5 stages × 20% each) gives 200 steps per stage.
+C0 with p_AR=0.2 gives 200 AR steps + 800 BD3 steps.
 
 ### Model sizes
 
-All three sizes are swept for each budget: 50M (768d, 7L), 98M (896d, 10L), 170M (1024d, 14L). `run_isoflop.py` handles this automatically.
+50M only (768d, 7L) for Phase 1. `run_isoflop.py` now defaults to `["50M"]`.
+To re-enable multi-size sweeps later, pass `--sizes 50M 98M 170M`.
 
 ### Output
 
@@ -175,13 +178,15 @@ Split work across two A100 VMs to halve wall-clock time:
 
 | VM-1 | VM-2 |
 |------|------|
-| AdamW LR sweeps (9 combos) | NorMuon LR sweeps (9 combos) |
-| AdamW baselines + C0 | NorMuon baselines + C0 |
-| AdamW C1 | NorMuon C1 |
+| AdamW baselines + C0 + C1 (50M) | NorMuon LR sweeps (3 combos, 50M) |
+| — | NorMuon baselines + C0 + C1 (50M) |
+
+AdamW LR calibration is complete (1e-3 for all families at 50M).
+NorMuon still needs the 3 sweeps (ar, mdlm, bd3lm × 50M).
 
 Both VMs need `prepare.py` run independently (data is stored locally in `data_cache/`).
 
-After sweeps, copy `calibrated_lrs.json` and `calibrated_normuon.json` between VMs so both have the full set of calibrated LRs for the scaling runs.
+After NorMuon sweeps, copy `calibrated_normuon.json` to the AdamW VM so both have the full set of calibrated configs.
 
 ---
 
@@ -195,7 +200,7 @@ After sweeps, copy `calibrated_lrs.json` and `calibrated_normuon.json` between V
 | Gradient accumulation | 2 | `CLIMBMIX_GRAD_ACCUM` |
 | Effective batch size | 256 | 128 x 2 |
 | Tokens per step | 524,288 | 256 x 2,048 |
-| LR sweep steps | 2,000 | `LR_SWEEP_STEPS` |
+| LR sweep steps | 200 | `LR_SWEEP_STEPS` |
 | LR warmup | 5% | `LR_SWEEP_WARMUP_FRAC` |
 | AdamW LR grid (AR) | [1e-4, 3e-4, 1e-3, 3e-3, 1e-2] | `LR_SWEEP_GRIDS` |
 | AdamW LR grid (MDLM/BD3) | [3e-4, 1e-3, 3e-3, 1e-2, 3e-2] | `LR_SWEEP_GRIDS` |

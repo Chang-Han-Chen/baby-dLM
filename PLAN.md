@@ -142,38 +142,92 @@ all curricula that use that optimizer family.
 The key point is that `adamw` remains untouched.  The only new optimizer path
 is `normuon`.
 
+### 4.1  Calibration results (50M)
+
+**Scope decision:** Phase 1 runs at 50M only.  LR sweeps were run for AR at
+50M and the selected configs are reused for MDLM and BD3-LM at the same scale.
+98M and 170M sweeps are deferred until after Phase 1 curriculum results.
+
+**AdamW** — 1D sweep over `[1e-4, 3e-4, 1e-3, 3e-3, 1e-2]` on AR/50M.
+All 5 runs stable.  Selected LR = **1.0e-3** (loss=4.507).
+
+| LR     | final loss | stable |
+|--------|-----------|--------|
+| 1e-4   | 5.522     | yes    |
+| 3e-4   | 5.041     | yes    |
+| **1e-3** | **4.507** | yes  |
+| 3e-3   | 4.665     | yes    |
+| 1e-2   | 6.205     | yes    |
+
+Applied to all three families at 50M → `calibrated_lrs.json`.
+
+**NorMuon** — 2D sweep over `adam_mult × matrix_mult ∈ {0.3, 1.0, 3.0}²`
+on AR/50M.  All 9 runs stable.  Selected config = **adam_mult=0.3,
+matrix_mult=1.0** (loss=5.109).
+
+| adam_mult | matrix_mult | final loss |
+|-----------|-------------|-----------|
+| **0.3**   | **1.0**     | **5.109** |
+| 0.3       | 0.3         | 5.131     |
+| 0.3       | 3.0         | 5.143     |
+| 1.0       | 1.0         | 5.136     |
+| 1.0       | 0.3         | 5.155     |
+| 1.0       | 3.0         | 5.166     |
+| 3.0       | 1.0         | 5.343     |
+| 3.0       | 0.3         | 5.387     |
+| 3.0       | 3.0         | 5.364     |
+
+Pattern: lower `adam_mult` is consistently better; `matrix_mult=1.0` is the
+sweet spot.  Applied to all three families at 50M → `calibrated_normuon.json`.
+
 ---
 
-## 5  Scaling laws (IsoFLOP)
+## 5  Curriculum experiments (Phase 1)
+
+Phase 1 runs curriculum 0 and curriculum 1 at 50M scale with both optimizer
+families, using a fixed step budget rather than a FLOP budget.
+
+**Training scope:**
+- Model size: 50M only
+- Optimizer families: `adamw`, `normuon`
+- Curricula: C0 (sweep p_AR ∈ {0.2, 0.3, 0.5, 0.8}) and C1 (geometric)
+- Total steps per run: 1000, split across stages by `flop_frac`
+- LR schedule: warmup-stable (5% linear warmup, then constant)
+
+This gives **10 runs** total (5 curricula × 2 optimizers).
+
+### 5.1  Step allocation examples
+
+C0 with p_AR=0.2: 200 AR steps → 800 BD3(16) steps.
+C0 with p_AR=0.8: 800 AR steps → 200 BD3(16) steps.
+C1 (5 equal stages): 200 steps each for AR → BD3(2) → BD3(4) → BD3(8) → BD3(16).
+
+### 5.2  Execution order
+1. ~~Implement `--optimizer normuon`~~ Done.
+2. ~~Run LR calibration for 50M.~~ Done (§4.1).
+3. ~~Freeze calibrated configs.~~ Done (`calibrated_lrs.json`,
+   `calibrated_normuon.json`).
+4. Run curriculum 0 and curriculum 1 for both optimizers at 50M/1000 steps.
+5. Analyze results: compare optimizer families, compare p_AR schedules,
+   compare C0 vs C1.
+6. Decide whether to proceed to IsoFLOP scaling (§5A) or additional curricula.
+
+### 5.3  Metrics
+- Primary: validation BPB (bits per byte) at the end of the final stage.
+- Secondary: per-stage train/val loss curves for diagnosing stage transitions.
+- Log optimizer family and calibrated LR settings in every result.
+
+---
+
+## 5A  Scaling laws (IsoFLOP) — deferred
+
+Full IsoFLOP sweeps are deferred until after Phase 1 curriculum results clarify
+which curricula and optimizer families are worth scaling up.
 
 Compute budgets: `C ∈ {1e18, 2e18, 4e18, 1e19}` FLOPs.
 
-For each (C, curriculum) pair, sweep model sizes and record the best validation
-loss.  This gives one IsoFLOP curve per curriculum.
-
-**LR schedule**: warmup-stable (linear warmup for 5% then constant LR, no
-cosine decay), using the preselected LR config for the corresponding
-`(optimizer_family, model_family, size)` pair.
-This lets us read off the loss at any step without retraining, so each
-(model_size, curriculum) combination needs only **one run**.
-
-Phase 1 scope:
-- Run both optimizer families (`adamw`, `normuon`) on the no-curriculum
-  baselines, curriculum 0, and curriculum 1.
-- Defer curricula 2–4 until the optimizer comparison is understood.
-- Log optimizer family and calibrated LR settings in every result table and
-  serialized artifact.
-
-### 5.1  First-pass execution order
-1. Implement `--optimizer normuon` while leaving the current `adamw` path
-   untouched.
-2. Run LR calibration for all `(optimizer_family, model_family, size)` pairs.
-3. Freeze the selected LR configs and write them to config/artifact files.
-4. Run the no-curriculum baselines for both optimizers.
-5. Run curriculum 0 for both optimizers.
-6. Run curriculum 1 for both optimizers.
-7. Summarize results and decide whether curricula 2–4 are worth running under
-   both optimizers.
+For each (C, curriculum) pair, sweep model sizes (50M, 98M, 170M) and record
+the best validation loss.  This gives one IsoFLOP curve per curriculum.
 
 FLOP accounting (unchanged from `experiment_config.py`):
 - Count only non-embedding parameters: `N = 12 * n_layer * n_embd^2`
@@ -233,8 +287,9 @@ New script `run_lr_sweep.py`:
 
 ### 6.4  Add curriculum runner
 New script `run_curriculum.py`:
-1. Takes a curriculum spec + total FLOP budget + model size.
-2. For each stage: compute steps from FLOP fraction and stage objective.
+1. Takes a curriculum spec + (total FLOP budget OR total steps) + model size.
+2. For each stage: compute steps from FLOP fraction (budget mode) or directly
+   from `round(total_steps * flop_frac)` (steps mode).
 3. Launch `train.py` with the stage's `--model`, `--block_len` when needed,
    the calibrated optimizer config for that `(optimizer_family, model_family,
    size)` pair, and `--resume_from` pointing to the previous stage's checkpoint.

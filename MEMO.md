@@ -190,6 +190,69 @@ Deleted ~120 lines: `sweep_adamw()`, `sweep_normuon()`, `sweep_one_pair()`, and 
 
 ---
 
+## 2026-04-10: LR Calibration Results & Phase 1 Scope Decisions
+
+### AdamW LR sweep: AR/50M
+
+Ran the full 5-point sweep `[1e-4, 3e-4, 1e-3, 3e-3, 1e-2]` on AR/50M.
+All 5 candidates stable (no early aborts). Clean parabolic loss curve.
+Selected **LR = 1e-3** (loss=4.507), with 3e-3 as runner-up (4.665).
+
+| LR | loss | wall time |
+|----|------|-----------|
+| 1e-4 | 5.522 | 369s |
+| 3e-4 | 5.041 | 342s |
+| **1e-3** | **4.507** | 340s |
+| 3e-3 | 4.665 | 341s |
+| 1e-2 | 6.205 | 341s |
+
+Total wall time: 29 min (sequential, 1 worker, torch.compile enabled).
+
+### NorMuon LR sweep: AR/50M
+
+Ran the 3×3 grid `adam_mult × matrix_mult ∈ {0.3, 1.0, 3.0}²`.
+All 9 runs stable. Selected **adam_mult=0.3, matrix_mult=1.0** (loss=5.109).
+
+Clear pattern: lower `adam_mult` is consistently better across all `matrix_mult`
+values. Within the `adam_mult=0.3` row, `matrix_mult=1.0` wins but the spread is
+only 0.034 (5.109 to 5.143). The `adam_mult=1.0` row is ~0.03 worse uniformly.
+The `adam_mult=3.0` row is ~0.25 worse — much more sensitivity to the Adam
+group LR than the Muon matrix LR.
+
+### Scope decisions
+
+1. **50M only for Phase 1.** Defer 98M and 170M until curriculum results clarify
+   what's worth scaling up.
+
+2. **Shared AdamW LR across model families.** Use 1e-3 for AR, MDLM, and BD3-LM
+   at 50M. Rationale: the sweep was only run on AR, but at this scale a single
+   LR is a reasonable starting point. If MDLM or BD3-LM show instability during
+   curriculum runs, we can re-sweep for those families specifically.
+
+3. **Shared NorMuon config across model families.** Same rationale as above:
+   `adam_mult=0.3, matrix_mult=1.0` for all three families at 50M.
+
+4. **Steps instead of FLOP budget.** Added `--steps` flag to `run_curriculum.py`
+   as an alternative to `--budget`. Each stage gets `round(total_steps * flop_frac)`
+   steps. Phase 1 uses `--steps 1000`. This is simpler for quick experiments and
+   avoids the FLOP accounting indirection when we're not doing scaling-law fits.
+
+5. **Curriculum focus before IsoFLOP.** Phase 1 runs C0 (4 p_AR variants) and C1
+   with both optimizers at 50M/1000 steps = 10 total runs. IsoFLOP scaling sweeps
+   are deferred to a later phase.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `calibrated_lrs.json` | Set ar\|50M, mdlm\|50M, bd3lm\|50M = 0.001 |
+| `calibrated_normuon.json` | Created: ar\|50M, mdlm\|50M, bd3lm\|50M = {adam_mult: 0.3, matrix_mult: 1.0} |
+| `run_curriculum.py` | Added `--steps` flag (mutually exclusive with `--budget`); updated `run_stage()` and `run_curriculum()` to accept `total_steps` |
+| `PLAN.md` | Added §4.1 (calibration results), rewrote §5 (curriculum experiments), deferred IsoFLOP to §5A |
+| `WORKFLOW.md` | Updated LR sweep sections as complete, added `--steps 1000` commands, fixed LR_SWEEP_STEPS typo |
+
+---
+
 ## Files Changed
 
 | File | Change |

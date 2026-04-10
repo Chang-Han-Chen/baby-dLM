@@ -231,9 +231,10 @@ def run_stage(
     stage: ec.CurriculumStage,
     stage_index: int,
     size: str,
-    total_budget: float,
     out_dir: str,
     *,
+    total_budget: Optional[float] = None,
+    total_steps: Optional[int] = None,
     resume_from: Optional[str] = None,
     optimizer: str = "adamw",
     dry_run: bool = False,
@@ -244,9 +245,15 @@ def run_stage(
     """
     Launch train.py for a single curriculum stage.
 
+    Provide exactly one of *total_budget* (FLOP-based step calculation) or
+    *total_steps* (direct step count, split by flop_frac).
+
     Returns a StageResult on success, or None on failure / dry-run.
     """
-    stage_steps = compute_stage_steps(stage, size, total_budget)
+    if total_steps is not None:
+        stage_steps = max(1, round(total_steps * stage.flop_frac))
+    else:
+        stage_steps = compute_stage_steps(stage, size, total_budget)
 
     stage_dir = os.path.join(
         out_dir,
@@ -257,20 +264,36 @@ def run_stage(
 
     ckpt_path = os.path.join(stage_dir, "ckpt.pt")
 
-    # Build the command via experiment_config.build_stage_command
-    # which handles FLOP accounting, warmup_stable, and block_len.
+    # Build the train.py command.
+    # When total_steps is given, use build_command directly (no FLOP accounting).
+    # When total_budget is given, use build_stage_command (FLOP → steps).
     try:
-        cmd = ec.build_stage_command(
-            stage=stage,
-            size=size,
-            total_budget=total_budget,
-            out_dir=stage_dir,
-            resume_from=resume_from,
-            optimizer=optimizer,
-            eval_interval=eval_interval,
-            eval_iters=eval_iters,
-            save_interval=save_interval,
-        )
+        if total_steps is not None:
+            cmd = ec.build_command(
+                model=stage.model_family,
+                size=size,
+                out_dir=stage_dir,
+                max_iters=stage_steps,
+                block_len=stage.block_len,
+                warmup_stable=True,
+                resume_from=resume_from,
+                optimizer=optimizer,
+                eval_interval=eval_interval,
+                eval_iters=eval_iters,
+                save_interval=save_interval,
+            )
+        else:
+            cmd = ec.build_stage_command(
+                stage=stage,
+                size=size,
+                total_budget=total_budget,
+                out_dir=stage_dir,
+                resume_from=resume_from,
+                optimizer=optimizer,
+                eval_interval=eval_interval,
+                eval_iters=eval_iters,
+                save_interval=save_interval,
+            )
     except ValueError as e:
         if dry_run:
             # In dry-run, missing calibration is non-fatal — show what we can.
@@ -405,9 +428,10 @@ def _collect_lr_configs(
 def run_curriculum(
     curriculum: ec.Curriculum,
     size: str,
-    total_budget: float,
     out_dir: str,
     *,
+    total_budget: Optional[float] = None,
+    total_steps: Optional[int] = None,
     optimizer: str = "adamw",
     dry_run: bool = False,
     eval_interval: int = 300,
@@ -417,12 +441,18 @@ def run_curriculum(
     """
     Run all stages of a curriculum sequentially.
 
+    Provide exactly one of *total_budget* (FLOP-based step calculation) or
+    *total_steps* (direct: each stage gets round(total_steps * flop_frac) steps).
+
     Each stage warm-starts from the previous stage's checkpoint (weights
     only).  The optimizer and LR schedule are reset at each stage
     transition, as specified in PLAN.md §3.
 
     Returns a CurriculumResult on success (even partial), None on dry-run.
     """
+    if total_budget is None and total_steps is None:
+        raise ValueError("Provide either total_budget or total_steps")
+
     # Validate compatibility
     ec.check_size_curriculum_compat(size, curriculum)
 
@@ -442,10 +472,13 @@ def run_curriculum(
     # Store *all* per-family LR configs so mixed-family curricula
     # (e.g. AR → BD3-LM) don't lose the earlier-stage settings.
 
+    scope_str = (f"steps={total_steps}" if total_steps is not None
+                 else f"budget={total_budget:.2e}")
+
     print(f"\n{'='*70}")
     print(f"Curriculum: {curriculum.name}")
     print(f"  {curriculum.description}")
-    print(f"  size={size}  budget={total_budget:.2e}  optimizer={optimizer}")
+    print(f"  size={size}  {scope_str}  optimizer={optimizer}")
     print(f"  stages={len(curriculum.stages)}  out_dir={out_dir}")
     for fam, cfg in lr_configs.items():
         print(f"  LR config [{fam}]: {cfg}")
@@ -456,7 +489,9 @@ def run_curriculum(
         prev_ckpt = None
         for i, stage in enumerate(curriculum.stages):
             sr = run_stage(
-                stage, i, size, total_budget, out_dir,
+                stage, i, size, out_dir,
+                total_budget=total_budget,
+                total_steps=total_steps,
                 resume_from=prev_ckpt,
                 optimizer=optimizer,
                 dry_run=True,
@@ -471,7 +506,7 @@ def run_curriculum(
     cur_result = CurriculumResult(
         curriculum_name=curriculum.name,
         size=size,
-        total_budget=total_budget,
+        total_budget=total_budget or 0.0,
         optimizer_family=optimizer,
         lr_config=lr_configs,
     )
@@ -480,7 +515,9 @@ def run_curriculum(
 
     for i, stage in enumerate(curriculum.stages):
         stage_result = run_stage(
-            stage, i, size, total_budget, out_dir,
+            stage, i, size, out_dir,
+            total_budget=total_budget,
+            total_steps=total_steps,
             resume_from=prev_ckpt,
             optimizer=optimizer,
             dry_run=False,
@@ -552,10 +589,11 @@ def main():
         epilog=(
             "Examples:\n"
             "  python run_curriculum.py --list\n"
+            "  python run_curriculum.py --curriculum c1_geometric --size 50M --steps 1000\n"
             "  python run_curriculum.py --curriculum c1_geometric --size 50M --budget 1e18\n"
             "  python run_curriculum.py --curriculum baseline_ar --size 98M --budget 2e18 "
             "--optimizer normuon\n"
-            "  python run_curriculum.py --curriculum c0_plain_p20 --size 50M --budget 1e18 "
+            "  python run_curriculum.py --curriculum c0_plain_p20 --size 50M --steps 1000 "
             "--dry-run\n"
         ),
     )
@@ -575,7 +613,12 @@ def main():
     )
     parser.add_argument(
         "--budget", type=float, default=None,
-        help="Total FLOP budget (e.g., 1e18, 2e18)",
+        help="Total FLOP budget (e.g., 1e18, 2e18). Mutually exclusive with --steps.",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=None,
+        help="Total training steps, split across stages by flop_frac "
+             "(e.g., --steps 1000). Mutually exclusive with --budget.",
     )
     parser.add_argument(
         "--optimizer", type=str, default="adamw",
@@ -615,8 +658,10 @@ def main():
         parser.error("--curriculum is required (use --list to see options)")
     if args.size is None:
         parser.error("--size is required")
-    if args.budget is None:
-        parser.error("--budget is required")
+    if args.budget is None and args.steps is None:
+        parser.error("--budget or --steps is required")
+    if args.budget is not None and args.steps is not None:
+        parser.error("--budget and --steps are mutually exclusive")
 
     # Look up curriculum
     if args.curriculum not in CURRICULUM_REGISTRY:
@@ -628,18 +673,21 @@ def main():
 
     # Default output directory
     if args.out_dir is None:
-        budget_str = f"{args.budget:.0e}"
+        scope_str = (f"{args.steps}steps"
+                     if args.steps is not None
+                     else f"{args.budget:.0e}")
         args.out_dir = os.path.join(
             "runs", "curriculum",
-            f"{args.curriculum}_{args.size}_{budget_str}_{args.optimizer}",
+            f"{args.curriculum}_{args.size}_{scope_str}_{args.optimizer}",
         )
 
     # Run
     result = run_curriculum(
         curriculum=curriculum,
         size=args.size,
-        total_budget=args.budget,
         out_dir=args.out_dir,
+        total_budget=args.budget,
+        total_steps=args.steps,
         optimizer=args.optimizer,
         dry_run=args.dry_run,
         eval_interval=args.eval_interval,

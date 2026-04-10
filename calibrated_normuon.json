@@ -1,0 +1,14 @@
+{
+  "ar|50M": {
+    "adam_mult": 0.3,
+    "matrix_mult": 1.0
+  },
+  "mdlm|50M": {
+    "adam_mult": 0.3,
+    "matrix_mult": 1.0
+  },
+  "bd3lm|50M": {
+    "adam_mult": 0.3,
+    "matrix_mult": 1.0
+  }
+}
