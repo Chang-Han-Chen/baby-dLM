@@ -1,0 +1,11 @@
+# Downloaded data and trained tokenizer (regenerate with: python prepare.py)
+data_cache/
+
+# Checkpoints and logs
+ckpt_*.pt
+loss_*.pkl
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

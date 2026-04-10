@@ -4,7 +4,7 @@ Downloads data shards and trains a BPE tokenizer.
 Usage:
     python prepare.py                  # full prep (download + tokenizer)
     python prepare.py --num-shards 8   # download only 8 shards (for testing)
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data and tokenizer are stored in <repo>/data_cache/.
 """
 import os
 import sys
@@ -24,8 +24,11 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
+# Store data alongside the repo so it survives Colab runtime restarts
+# and is easy to find.  Structure: <repo>/data_cache/{shards,tokenizer}/
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(_REPO_ROOT, "data_cache")
+DATA_DIR = os.path.join(CACHE_DIR, "shards")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
@@ -213,35 +216,15 @@ class Tokenizer:
         self.mask_token_id = enc.encode_single_token(MASK_TOKEN)
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        search_dirs = []
+    def from_directory(cls, tokenizer_dir=None):
         if tokenizer_dir is None:
             tokenizer_dir = TOKENIZER_DIR
-        tokenizer_dir = os.path.expanduser(tokenizer_dir)
-        search_dirs.extend([
-            tokenizer_dir,
-            os.path.join(tokenizer_dir, "tokenizer"),
-            os.path.join(os.path.dirname(tokenizer_dir), "tokenizer"),
-            TOKENIZER_DIR,
-        ])
-
-        seen = set()
-        tokenizer_pkl = None
-        for candidate in search_dirs:
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            candidate_pkl = os.path.join(candidate, "tokenizer.pkl")
-            if os.path.exists(candidate_pkl):
-                tokenizer_pkl = candidate_pkl
-                break
-
-        if tokenizer_pkl is None:
+        tokenizer_pkl = os.path.join(tokenizer_dir, "tokenizer.pkl")
+        if not os.path.exists(tokenizer_pkl):
             raise FileNotFoundError(
-                "Could not find tokenizer.pkl. Looked in: "
-                + ", ".join(search_dirs)
+                f"Could not find {tokenizer_pkl}. "
+                f"Run `python prepare.py` first."
             )
-
         with open(tokenizer_pkl, "rb") as f:
             enc = pickle.load(f)
         return cls(enc)

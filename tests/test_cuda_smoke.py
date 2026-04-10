@@ -26,6 +26,17 @@ import tempfile
 
 import pytest
 
+# Import data paths from prepare.py (single source of truth), but fall back
+# to computing them directly so test collection never crashes if tiktoken
+# or torch aren't installed.
+try:
+    from prepare import DATA_DIR as PREPARE_DATA_DIR
+    from prepare import TOKENIZER_DIR as PREPARE_TOKENIZER_DIR
+except ImportError:
+    _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PREPARE_DATA_DIR = os.path.join(_repo, "data_cache", "shards")
+    PREPARE_TOKENIZER_DIR = os.path.join(_repo, "data_cache", "tokenizer")
+
 # ---------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------
@@ -105,12 +116,8 @@ pytestmark = pytest.mark.skipif(
 # Check whether ClimbMix data has been downloaded
 # ---------------------------------------------------------------
 
-_CLIMBMIX_TOKENIZER = os.path.join(
-    os.path.expanduser("~"), ".cache", "autoresearch", "tokenizer", "tokenizer.pkl"
-)
-_CLIMBMIX_DATA_DIR = os.path.join(
-    os.path.expanduser("~"), ".cache", "autoresearch", "data"
-)
+_CLIMBMIX_TOKENIZER = os.path.join(PREPARE_TOKENIZER_DIR, "tokenizer.pkl")
+_CLIMBMIX_DATA_DIR = PREPARE_DATA_DIR
 
 def _climbmix_available():
     """Return True if ClimbMix tokenizer + at least 1 shard exist."""

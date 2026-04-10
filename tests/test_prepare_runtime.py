@@ -24,9 +24,9 @@ class DummyEnc:
         return "decoded"
 
 
-def test_tokenizer_from_directory_accepts_data_dir(tmp_path):
+def test_tokenizer_from_directory_reads_tokenizer_dir(tmp_path):
     cache_dir = tmp_path / "cache"
-    data_dir = cache_dir / "data"
+    data_dir = cache_dir / "shards"
     tokenizer_dir = cache_dir / "tokenizer"
     data_dir.mkdir(parents=True)
     tokenizer_dir.mkdir(parents=True)
@@ -34,7 +34,7 @@ def test_tokenizer_from_directory_accepts_data_dir(tmp_path):
     with open(tokenizer_dir / "tokenizer.pkl", "wb") as f:
         pickle.dump(DummyEnc(), f)
 
-    tok = prepare.Tokenizer.from_directory(str(data_dir))
+    tok = prepare.Tokenizer.from_directory(str(tokenizer_dir))
 
     assert tok.vocab_size == 8192
     assert tok.mask_token_id == 1
