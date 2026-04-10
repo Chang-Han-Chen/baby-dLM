@@ -108,29 +108,36 @@ calibrated_normuon.json    # auto-selected NorMuon configs
 
 Step counts are automatically computed from the budget, model family (AR/MDLM use 6N FLOP multiplier, BD3-LM uses 12N due to dual-stream), and effective batch size (256 tokens/step = 128 micro-batch x 2 grad_accum x 2048 seq_len = 524,288 tokens/step).
 
-### Phase 1: Curricula 0-1 at 50M (both optimizers, 1000 steps)
+### Phase 1: Curricula 0-1 at 50M (both optimizers, 1000 total steps)
+
+Uses checkpoint sharing: one shared AR warmup (800 steps) produces checkpoints
+at steps 200, 300, 500, 800. C0 variants and C1 then branch from the appropriate
+AR checkpoint. This avoids redundant AR training — 1 AR run serves all 5 curricula.
 
 ```bash
-# Curriculum 0: AR -> BD3-LM(16), sweep p_AR — AdamW
-python run_curriculum.py --curriculum c0_plain_p20 --size 50M --steps 1000 --optimizer adamw
-python run_curriculum.py --curriculum c0_plain_p30 --size 50M --steps 1000 --optimizer adamw
-python run_curriculum.py --curriculum c0_plain_p50 --size 50M --steps 1000 --optimizer adamw
-python run_curriculum.py --curriculum c0_plain_p80 --size 50M --steps 1000 --optimizer adamw
+# On machine 1:
+bash run_phase1.sh adamw
 
-# Curriculum 1: Geometric doubling AR -> BD3(2) -> BD3(4) -> BD3(8) -> BD3(16) — AdamW
-python run_curriculum.py --curriculum c1_geometric --size 50M --steps 1000 --optimizer adamw
-
-# Same 5 runs with NorMuon
-python run_curriculum.py --curriculum c0_plain_p20 --size 50M --steps 1000 --optimizer normuon
-python run_curriculum.py --curriculum c0_plain_p30 --size 50M --steps 1000 --optimizer normuon
-python run_curriculum.py --curriculum c0_plain_p50 --size 50M --steps 1000 --optimizer normuon
-python run_curriculum.py --curriculum c0_plain_p80 --size 50M --steps 1000 --optimizer normuon
-python run_curriculum.py --curriculum c1_geometric --size 50M --steps 1000 --optimizer normuon
+# On machine 2:
+bash run_phase1.sh normuon
 ```
 
-The `--steps 1000` flag splits 1000 total steps across stages by `flop_frac`.
-For example, C1 (5 stages × 20% each) gives 200 steps per stage.
-C0 with p_AR=0.2 gives 200 AR steps + 800 BD3 steps.
+The script runs sequentially within one optimizer:
+
+1. **Shared AR warmup** — 800 steps, `--save-interval 100` → `ckpt_step{100..800}.pt`
+2. **C0 p80** — 200 BD3(16) steps from AR step 800
+3. **C0 p50** — 500 BD3(16) steps from AR step 500
+4. **C0 p30** — 700 BD3(16) steps from AR step 300
+5. **C0 p20** — 800 BD3(16) steps from AR step 200
+6. **C1 bl=2** — 200 steps from AR step 200 (same checkpoint as C0 p20)
+7. **C1 bl=4** → **bl=8** → **bl=16** — 200 steps each, chained
+
+Note: C0 p20 and C1 share the AR step-200 checkpoint. After the AR stage,
+the four C0 continuations are independent and could run in parallel if multiple
+GPUs are available.
+
+Total training steps per optimizer: 800 (AR) + 200+500+700+800 (C0) + 4×200 (C1) = 3800 steps.
+Without sharing, it would be 4×1000 (C0) + 1000 (C1) = 5000 steps. Savings: 24%.
 
 ### Model sizes
 

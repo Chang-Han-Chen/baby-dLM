@@ -707,8 +707,13 @@ if __name__ == "__main__":
             }
             if normuon_lrs is not None:
                 ckpt["normuon_lrs"] = normuon_lrs
+            # Save step-numbered checkpoint (for checkpoint sharing across
+            # curriculum variants) AND overwrite the latest checkpoint.
+            base, ext = os.path.splitext(checkpoint_path)
+            step_path = f"{base}_step{iter}{ext}"
+            torch.save(ckpt, step_path)
             torch.save(ckpt, checkpoint_path)
-            print(f"saved checkpoint to {checkpoint_path} at step {iter}")
+            print(f"saved checkpoint to {step_path} (and {checkpoint_path}) at step {iter}")
 
         # GC management: Python's cyclic GC causes ~500ms stalls when it
         # scans the autograd graph.  Run a full collection on step 0 (to
