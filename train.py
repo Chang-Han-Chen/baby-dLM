@@ -620,7 +620,11 @@ if __name__ == "__main__":
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
-        should_run_loss_eval = eval_interval > 0 and (iter % eval_interval == 0)
+        # Skip step-0 loss eval: for short runs and LR sweeps this adds
+        # substantial overhead before any training has happened.
+        should_run_loss_eval = (
+            eval_interval > 0 and iter > 0 and (iter % eval_interval == 0)
+        )
         should_run_gpt2_eval = gpt2_enabled and (iter % gpt2_eval_interval == 0)
         should_print_sample = sample_interval > 0 and (iter % sample_interval == 0)
 

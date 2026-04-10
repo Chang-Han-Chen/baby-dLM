@@ -136,6 +136,17 @@ Also reduced `LR_SWEEP_STEPS` from 2000 to 200 in `experiment_config.py`.
 - 1 worker via parallel dispatcher (sequential execution, respects all flags)
 - Peak VRAM: ~43 GiB per process on A100-80GB
 
+#### Issue H: Sweep still ran loss eval at step 0
+While investigating unexpectedly slow 200-step AR sweep wall times, found that the sweep was still paying for one full loss-eval pass before any training. `run_lr_sweep.py` sets `eval_interval = LR_SWEEP_STEPS + 1` and `skip_final_eval = True`, intending to suppress eval during short sweeps. But `train.py` used `iter % eval_interval == 0`, so `iter=0` still triggered `estimate_loss()`.
+
+With the default `eval_iters = 50`, that means each sweep candidate did:
+- 50 train eval batches
+- 50 val eval batches
+
+So every 200-step LR candidate was actually doing 100 extra forward-only batches up front, which made wall times look much worse than the true training path.
+
+**Fix:** Loss eval now requires `iter > 0`, so periodic eval starts after training has begun. This keeps normal long-run eval behavior intact while making LR sweeps actually skip eval as intended.
+
 ---
 
 ## 2026-04-10: Efficiency Refactor (inspired by Karpathy's autoresearch train.py)
@@ -180,6 +191,7 @@ Deleted ~120 lines: `sweep_adamw()`, `sweep_normuon()`, `sweep_one_pair()`, and 
 | `train.py:5` | Added `import gc` for GC management |
 | `train.py:207-215` | Enable Flash SDP + mem-efficient SDP, log SDPA backend status at startup |
 | `train.py:706-713` | GC management: collect/freeze/disable after step 0, re-collect every 5000 steps |
+| `train.py:623-627` | Skip step-0 loss eval so short LR sweeps do not pay 100 extra eval batches before training |
 | `train.py:691` | Log frequency: `iter % 100` → `iter % min(100, eval_interval)` |
 | `tests/test_cuda_smoke.py:88` | Default `min_steps` 5 → 3 |
 | `experiment_config.py:487` | `LR_SWEEP_STEPS` 2000 → 200 |
