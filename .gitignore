@@ -2,8 +2,9 @@
 data_cache/
 
 # Checkpoints and logs
-ckpt_*.pt
-loss_*.pkl
+*.pt
+*.pkl
+runs/
 
 # Python
 __pycache__/
