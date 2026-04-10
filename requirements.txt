@@ -1,4 +1,11 @@
 # Core
+# Pin to CUDA 12.6 wheels — compatible with driver 565.77 (CUDA ≤12.7).
+# --index-url replaces PyPI as primary, so pip resolves torch from the
+# cu126 index first. --extra-index-url adds PyPI back as a fallback for
+# non-torch packages (tiktoken, pyarrow, etc.) that aren't on the
+# PyTorch index.
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
 torch>=2.1
 tiktoken
 rustbpe

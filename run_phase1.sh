@@ -23,7 +23,7 @@ python -u train.py \
   --grad_accum_steps 2 --max_iters 800 \
   --warmup_stable true --warmup_iters 40 \
   --eval_interval 300 --eval_iters 50 \
-  --train_log_interval 100 --save_interval 100 \
+  --train_log_interval 100 --save_steps 200,300,500,800 --save_weights_only true \
   --skip_final_eval false --skip_final_checkpoint false \
   --use_compile true --num_final_samples 5 \
   --gpt2_eval_interval 0 --gpt2_eval_samples 0 --sample_interval 0 \

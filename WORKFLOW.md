@@ -124,7 +124,7 @@ bash run_phase1.sh normuon
 
 The script runs sequentially within one optimizer:
 
-1. **Shared AR warmup** — 800 steps, `--save-interval 100` → `ckpt_step{100..800}.pt`
+1. **Shared AR warmup** — 800 steps, `--save_steps 200,300,500,800 --save_weights_only true` → `ckpt_step{200,300,500,800}.pt` (weights-only, ~250 MB each)
 2. **C0 p80** — 200 BD3(16) steps from AR step 800
 3. **C0 p50** — 500 BD3(16) steps from AR step 500
 4. **C0 p30** — 700 BD3(16) steps from AR step 300

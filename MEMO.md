@@ -241,6 +241,54 @@ group LR than the Muon matrix LR.
    with both optimizers at 50M/1000 steps = 10 total runs. IsoFLOP scaling sweeps
    are deferred to a later phase.
 
+### Checkpoint sharing & disk-space optimizations
+
+Phase 1 uses a **shared AR warmup** strategy: one 800-step AR run produces
+intermediate checkpoints at steps 200, 300, 500, 800. C0 variants branch from
+these (each at a different AR→BD3 transition point), and C1 branches from
+step 200. This works because the warmup-stable (WS) LR schedule makes the AR
+training trajectory path-independent — identical weights at every step
+regardless of when you plan to branch.
+
+Two train.py changes to minimize disk usage on the 16 GB VM:
+
+1. **`--save_steps` flag.** Accepts a comma-separated list of exact step
+   numbers (e.g. `--save_steps 200,300,500,800`). When set, overrides
+   `--save_interval` so only those specific checkpoints are written. Avoids
+   saving unneeded intermediate steps (100, 400, 600, 700).
+
+2. **`--save_weights_only` flag.** When true, step-numbered checkpoints omit
+   `optimizer_state_dict`, reducing each from ~712 MB to ~250 MB. The final
+   checkpoint (via `--skip_final_checkpoint false`) is always full. This is
+   safe because stage transitions reset the optimizer and LR schedule anyway —
+   `load_model_weights()` only reads `model_state_dict`.
+
+Net effect: AR warmup writes 4 × 250 MB ≈ 1 GB instead of 8 × 712 MB ≈ 5.7 GB.
+
+### Bug fixes in checkpoint numbering (train.py)
+
+**P1 — ckpt_step800.pt never created.** `for iter in range(800)` runs 0..799;
+the old condition `iter % 100 == 0` fires at 0, 100, ..., 700 but never 800.
+Fix: use `(iter + 1) % save_interval == 0` so iter=799 → completed_steps=800
+→ saves ckpt_step800.pt.
+
+**P2 — Off-by-one in step numbering.** At iter=200 the optimizer has done 201
+updates (0 through 200). Fix: `completed_steps = iter + 1` in both the filename
+and the checkpoint metadata `"iter"` field, so the number always means
+"completed updates."
+
+### Pre-flight tests (tests/test_cuda_smoke.py)
+
+Added `TestPhase1Preflight` with 4 tests verifying the checkpoint-sharing flow:
+step-numbered checkpoints are produced and match the final ckpt; C0 and C1
+resume flows work; NorMuon checkpoint sharing works.
+
+### CUDA 12.7 compatibility (requirements.txt)
+
+Added `--extra-index-url https://download.pytorch.org/whl/cu126` so pip pulls
+the CUDA 12.6 wheel (compatible with driver ≤12.7) instead of defaulting to
+CUDA 13.0 which the VM driver can't load.
+
 ### Files changed
 
 | File | Change |
@@ -248,6 +296,10 @@ group LR than the Muon matrix LR.
 | `calibrated_lrs.json` | Set ar\|50M, mdlm\|50M, bd3lm\|50M = 0.001 |
 | `calibrated_normuon.json` | Created: ar\|50M, mdlm\|50M, bd3lm\|50M = {adam_mult: 0.3, matrix_mult: 1.0} |
 | `run_curriculum.py` | Added `--steps` flag (mutually exclusive with `--budget`); updated `run_stage()` and `run_curriculum()` to accept `total_steps` |
+| `train.py` | Added `--save_steps`, `--save_weights_only` flags; fixed checkpoint step numbering (P1+P2); metadata uses `completed_steps` |
+| `run_phase1.sh` | Created: shared-AR-warmup + C0/C1 continuation script, parameterized by optimizer |
+| `tests/test_cuda_smoke.py` | Added `TestPhase1Preflight` (4 tests) |
+| `requirements.txt` | Added `--extra-index-url` for CUDA 12.6 wheels |
 | `PLAN.md` | Added §4.1 (calibration results), rewrote §5 (curriculum experiments), deferred IsoFLOP to §5A |
 | `WORKFLOW.md` | Updated LR sweep sections as complete, added `--steps 1000` commands, fixed LR_SWEEP_STEPS typo |
 

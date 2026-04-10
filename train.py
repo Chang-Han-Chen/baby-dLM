@@ -65,6 +65,16 @@ parser.add_argument("--learning_rate", type=float, default=3e-3)
 parser.add_argument("--min_lr", type=float, default=3e-4)
 parser.add_argument("--eval_iters", type=int, default=50)
 parser.add_argument("--save_interval", type=int, default=200)
+parser.add_argument(
+    "--save_steps", type=str, default="",
+    help="Comma-separated list of exact step numbers to save checkpoints at "
+         "(e.g. '200,300,500,800'). Overrides --save_interval when non-empty.",
+)
+parser.add_argument(
+    "--save_weights_only", type=str2bool, default=False,
+    help="If true, step-numbered checkpoints omit optimizer state to save disk. "
+         "The final checkpoint (--skip_final_checkpoint=false) is always full.",
+)
 parser.add_argument("--grad_clip", type=float, default=1.0)
 parser.add_argument(
     "--optimizer", type=str, default="adamw",
@@ -158,6 +168,9 @@ learning_rate = args.learning_rate
 min_lr = args.min_lr
 eval_iters = args.eval_iters
 save_interval = args.save_interval
+save_steps_set = set()
+if args.save_steps:
+    save_steps_set = {int(s.strip()) for s in args.save_steps.split(",") if s.strip()}
 grad_clip = args.grad_clip
 grad_accum_steps = args.grad_accum_steps
 gpt2_eval_interval = (
@@ -701,17 +714,22 @@ if __name__ == "__main__":
         # This ensures max_iters=800 actually produces ckpt_step800.pt
         # (the loop runs iter 0..799, so iter=800 never occurs).
         completed_steps = iter + 1
-        if save_interval > 0 and completed_steps % save_interval == 0:
+        should_save = (
+            (completed_steps in save_steps_set) if save_steps_set
+            else (save_interval > 0 and completed_steps % save_interval == 0)
+        )
+        if should_save:
             ckpt = {
                 "iter": completed_steps,
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
                 "loss": loss_val,
                 "args": vars(args),
                 "vocab_size": vocab_size,
                 "mask_token_id": mask_token_id,
                 "optimizer_family": optimizer_family,
             }
+            if not args.save_weights_only:
+                ckpt["optimizer_state_dict"] = optimizer.state_dict()
             if normuon_lrs is not None:
                 ckpt["normuon_lrs"] = normuon_lrs
             # Save step-numbered checkpoint (for checkpoint sharing across
