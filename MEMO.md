@@ -257,13 +257,15 @@ Two train.py changes to minimize disk usage on the 16 GB VM:
    `--save_interval` so only those specific checkpoints are written. Avoids
    saving unneeded intermediate steps (100, 400, 600, 700).
 
-2. **`--save_weights_only` flag.** When true, step-numbered checkpoints omit
-   `optimizer_state_dict`, reducing each from ~712 MB to ~250 MB. The final
-   checkpoint (via `--skip_final_checkpoint false`) is always full. This is
-   safe because stage transitions reset the optimizer and LR schedule anyway —
-   `load_model_weights()` only reads `model_state_dict`.
+2. **`--save_weights_only` flag.** When true, **all** checkpoints (both
+   step-numbered and final) omit `optimizer_state_dict`, reducing each from
+   ~712 MB to ~250 MB. This is safe because stage transitions reset the
+   optimizer and LR schedule anyway — `load_model_weights()` only reads
+   `model_state_dict`.
 
-Net effect: AR warmup writes 4 × 250 MB ≈ 1 GB instead of 8 × 712 MB ≈ 5.7 GB.
+Net effect: the full Phase 1 run (`run_phase1.sh`) produces 13 checkpoints
+per optimizer, all weights-only ≈ 13 × 250 MB ≈ **3.25 GB per optimizer**
+(~6.5 GB for both adamw + normuon).
 
 ### Bug fixes in checkpoint numbering (train.py)
 

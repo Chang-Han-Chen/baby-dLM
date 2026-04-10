@@ -72,8 +72,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--save_weights_only", type=str2bool, default=False,
-    help="If true, step-numbered checkpoints omit optimizer state to save disk. "
-         "The final checkpoint (--skip_final_checkpoint=false) is always full.",
+    help="If true, ALL checkpoints (step-numbered and final) omit optimizer state to save disk.",
 )
 parser.add_argument("--grad_clip", type=float, default=1.0)
 parser.add_argument(
@@ -787,13 +786,14 @@ if __name__ == "__main__":
         final_ckpt = {
             "iter": max_iters,
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
             "loss": loss_val,
             "args": vars(args),
             "vocab_size": vocab_size,
             "mask_token_id": mask_token_id,
             "optimizer_family": optimizer_family,
         }
+        if not args.save_weights_only:
+            final_ckpt["optimizer_state_dict"] = optimizer.state_dict()
         if normuon_lrs is not None:
             final_ckpt["normuon_lrs"] = normuon_lrs
         torch.save(final_ckpt, checkpoint_path)
