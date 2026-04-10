@@ -305,7 +305,7 @@ def run_single(
         matrix_mult=matrix_mult,
         # Disable torch.compile for sweeps: compilation spikes VRAM to
         # 50-80 GB even for small models, preventing parallel runs.
-        # The 2000-step sweep is too short to amortize compile cost anyway.
+        # The 200-step sweep is too short to amortize compile cost anyway.
         use_compile=False,
     )
     # When a smaller sweep batch_size is requested, use grad accumulation
@@ -600,139 +600,6 @@ def process_results(
 
 
 # ---------------------------------------------------------------
-# AdamW sweep (1D) — sequential legacy interface
-# ---------------------------------------------------------------
-
-def sweep_adamw(
-    model: str,
-    size: str,
-    out_root: str,
-    *,
-    dry_run: bool = False,
-) -> Optional[float]:
-    """
-    Run the full 1D LR grid for one (adamw, model, size) pair.
-    Returns the selected LR, or None in dry-run mode.
-    """
-    grid = ec.LR_SWEEP_GRIDS.get(model, ec.LR_SWEEP_GRID_DEFAULT)
-    print(f"\n{'='*60}")
-    print(f"Sweeping adamw / {model} / {size}  |  grid: {grid}")
-    print(f"{'='*60}")
-
-    traces = []
-    for lr in grid:
-        run_dir = os.path.join(out_root, f"adamw_{model}_{size}", f"lr_{lr:.0e}")
-        trace = run_single(model, size, lr, run_dir, dry_run=dry_run,
-                           optimizer="adamw")
-        if trace is not None:
-            traces.append(trace)
-
-    if not traces:
-        if dry_run:
-            print("  [dry-run] skipping selection")
-            return None
-        print("  ERROR: all runs failed")
-        return None
-
-    chosen_lr, chosen_trace = select_best_lr(traces)
-    print(f"\n  >> Selected LR = {chosen_lr:.1e}  "
-          f"(final_loss={chosen_trace.final_loss:.4f}, "
-          f"stable={chosen_trace.grad_norm_stable})")
-
-    ec.set_calibrated_lr(model, size, chosen_lr)
-    print(f"  >> Saved to calibrated_lrs.json")
-
-    traces_path = os.path.join(out_root, f"adamw_{model}_{size}", "sweep_traces.pkl")
-    with open(traces_path, "wb") as f:
-        pickle.dump(traces, f)
-    print(f"  >> Traces saved to {traces_path}")
-
-    return chosen_lr
-
-
-# ---------------------------------------------------------------
-# NorMuon sweep (2D) — sequential legacy interface
-# ---------------------------------------------------------------
-
-def sweep_normuon(
-    model: str,
-    size: str,
-    out_root: str,
-    *,
-    dry_run: bool = False,
-) -> Optional[dict]:
-    """
-    Run the 2D (adam_mult, matrix_mult) grid for one (normuon, model, size) pair.
-    Returns the selected config dict, or None in dry-run mode.
-    """
-    adam_grid = ec.NORMUON_ADAM_MULT_GRID
-    matrix_grid = ec.NORMUON_MATRIX_MULT_GRID
-    print(f"\n{'='*60}")
-    print(f"Sweeping normuon / {model} / {size}")
-    print(f"  adam_mult grid:   {adam_grid}")
-    print(f"  matrix_mult grid: {matrix_grid}")
-    print(f"{'='*60}")
-
-    traces = []
-    for am in adam_grid:
-        for mm in matrix_grid:
-            run_dir = os.path.join(
-                out_root,
-                f"normuon_{model}_{size}",
-                f"am_{am:.1f}_mm_{mm:.1f}",
-            )
-            trace = run_single(
-                model, size, lr=1.0, out_dir=run_dir,
-                dry_run=dry_run, optimizer="normuon",
-                adam_mult=am, matrix_mult=mm,
-            )
-            if trace is not None:
-                traces.append(trace)
-
-    if not traces:
-        if dry_run:
-            print("  [dry-run] skipping selection")
-            return None
-        print("  ERROR: all normuon runs failed")
-        return None
-
-    chosen_config, chosen_trace = select_best_normuon(traces)
-    print(f"\n  >> Selected normuon config: adam_mult={chosen_config['adam_mult']}, "
-          f"matrix_mult={chosen_config['matrix_mult']}  "
-          f"(final_loss={chosen_trace.final_loss:.4f}, "
-          f"stable={chosen_trace.grad_norm_stable})")
-
-    ec.set_calibrated_normuon(
-        model, size,
-        chosen_config["adam_mult"],
-        chosen_config["matrix_mult"],
-    )
-    print(f"  >> Saved to calibrated_normuon.json")
-
-    traces_path = os.path.join(out_root, f"normuon_{model}_{size}", "sweep_traces.pkl")
-    with open(traces_path, "wb") as f:
-        pickle.dump(traces, f)
-    print(f"  >> Traces saved to {traces_path}")
-
-    return chosen_config
-
-
-# ---------------------------------------------------------------
-# Legacy compat: sweep_one_pair (delegates to sweep_adamw)
-# ---------------------------------------------------------------
-
-def sweep_one_pair(
-    model: str,
-    size: str,
-    out_root: str,
-    *,
-    dry_run: bool = False,
-) -> Optional[float]:
-    """Backward-compatible wrapper; runs the adamw sweep only."""
-    return sweep_adamw(model, size, out_root, dry_run=dry_run)
-
-
-# ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
 
@@ -774,11 +641,12 @@ def main():
         help="Override batch_size for sweep runs (default: use production "
              "batch_size from experiment_config). Smaller values use less "
              "VRAM and allow more parallelism, at the cost of noisier "
-             "loss curves. Recommended: 64 for maximum parallelism.",
+             "loss curves. Tune based on VRAM; 32 is a good starting point "
+             "on A100-80GB.",
     )
     parser.add_argument(
         "--no-early-abort", action="store_true",
-        help="Disable early-abort of diverged runs (run all 2000 steps "
+        help="Disable early-abort of diverged runs (run all configured sweep steps "
              "regardless of loss/grad-norm blow-ups).",
     )
     parser.add_argument(
@@ -829,43 +697,36 @@ def main():
         print(f"  {k}: {n} runs")
 
     # ---- Execute ----
-    if False:
-        # Legacy sequential mode disabled — the parallel dispatcher handles
-        # max_workers=1 correctly and respects --sweep-batch-size.
-        pass
-    else:
-        # Parallel mode
-        t_start = time.time()
-        grouped_traces = run_sweep_parallel(
-            jobs,
-            max_workers=max_workers,
-            dry_run=args.dry_run,
-            batch_size=args.sweep_batch_size,
-            early_abort=not args.no_early_abort,
+    t_start = time.time()
+    grouped_traces = run_sweep_parallel(
+        jobs,
+        max_workers=max_workers,
+        dry_run=args.dry_run,
+        batch_size=args.sweep_batch_size,
+        early_abort=not args.no_early_abort,
+    )
+    wall_total = time.time() - t_start
+
+    if args.dry_run:
+        print(f"\n[Dry-run complete: {len(jobs)} jobs listed]")
+        return
+
+    adamw_results, normuon_results = process_results(
+        grouped_traces, args.out_root,
+    )
+
+    print(f"\nTotal wall time: {wall_total:.0f}s "
+          f"({wall_total/60:.1f} min)")
+    if len(jobs) > 1:
+        sequential_est = sum(
+            t.wall_seconds
+            for traces in grouped_traces.values()
+            for t in traces
         )
-        wall_total = time.time() - t_start
-
-        if args.dry_run:
-            print(f"\n[Dry-run complete: {len(jobs)} jobs listed]")
-            return
-
-        adamw_results, normuon_results = process_results(
-            grouped_traces, args.out_root,
-        )
-
-        print(f"\nTotal wall time: {wall_total:.0f}s "
-              f"({wall_total/60:.1f} min)")
-        if len(jobs) > 1:
-            avg = wall_total / len(jobs)
-            sequential_est = sum(
-                t.wall_seconds
-                for traces in grouped_traces.values()
-                for t in traces
-            )
-            if sequential_est > 0:
-                print(f"Estimated sequential time: {sequential_est:.0f}s "
-                      f"({sequential_est/60:.1f} min)")
-                print(f"Speedup: {sequential_est/wall_total:.1f}×")
+        if sequential_est > 0:
+            print(f"Estimated sequential time: {sequential_est:.0f}s "
+                  f"({sequential_est/60:.1f} min)")
+            print(f"Speedup: {sequential_est/wall_total:.1f}×")
 
     # ---- Print summary tables ----
     if adamw_results:

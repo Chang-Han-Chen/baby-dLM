@@ -1,4 +1,9 @@
 import os
+# Reduce CUDA memory fragmentation (PyTorch 2.1+).  Must be set before
+# any torch.cuda call.  See: https://pytorch.org/docs/stable/notes/cuda.html
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import gc
 import sys
 import time
 import math
@@ -198,6 +203,16 @@ device = (
     if torch.cuda.is_available()
     else ("mps" if torch.backends.mps.is_available() else "cpu")
 )
+
+# Ensure Flash Attention is preferred by SDPA when available.
+if device == "cuda":
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    # Log which SDPA backends are available for debugging VRAM issues.
+    print(f"SDPA backends — flash: {torch.backends.cuda.flash_sdp_enabled()}, "
+          f"mem_efficient: {torch.backends.cuda.mem_efficient_sdp_enabled()}, "
+          f"math: {torch.backends.cuda.math_sdp_enabled()}")
+    print(f"CUDA alloc conf: {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '(not set)')}")
 
 torch.manual_seed(args.seed)
 
@@ -687,6 +702,17 @@ if __name__ == "__main__":
                 ckpt["normuon_lrs"] = normuon_lrs
             torch.save(ckpt, checkpoint_path)
             print(f"saved checkpoint to {checkpoint_path} at step {iter}")
+
+        # GC management: Python's cyclic GC causes ~500ms stalls when it
+        # scans the autograd graph.  Run a full collection on step 0 (to
+        # clean up model-init garbage), then freeze and disable.  Re-collect
+        # every 5000 steps to prevent slow leaks.
+        if iter == 0:
+            gc.collect()
+            gc.freeze()
+            gc.disable()
+        elif (iter + 1) % 5000 == 0:
+            gc.collect()
 
         if iter % min(100, eval_interval) == 0 or iter == max_iters - 1:
             current_token_epoch = token_epochs_from_steps(iter, num_train_tokens)

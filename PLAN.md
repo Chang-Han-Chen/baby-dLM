@@ -106,10 +106,10 @@ Informed by results of curricula 1–3.  Placeholder for now.
 This is the first experiment.
 
 For each `(optimizer_family, model_family, size)` pair:
-- Train for 2000 steps with a warmup-stable schedule (5% linear warmup, then
+- Train for 200 steps with a warmup-stable schedule (5% linear warmup, then
   constant LR).
 - Keep the selection rule the same for both optimizers:
-  - track train loss and grad norm throughout the 2000-step run
+  - track train loss and grad norm throughout the 200-step run
   - discard unstable runs (loss blow-up / grad norm blow-up / NaNs)
   - choose the stable run with the best train loss
 - `adamw` calibration:
@@ -222,7 +222,7 @@ family, and model size.
 
 ### 6.3  Add LR sweep script
 New script `run_lr_sweep.py`:
-1. For each `(optimizer_family, model_family, size)`, run 2000-step sweeps.
+1. For each `(optimizer_family, model_family, size)`, run 200-step sweeps.
 2. For `adamw`, run the existing 1D LR sweep.
 3. For `normuon`, run a small 2D grid over `(adam_mult, matrix_mult)` around
    the Karpathy reference setting.

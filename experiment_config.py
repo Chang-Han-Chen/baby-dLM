@@ -468,7 +468,7 @@ def set_calibrated_normuon(model, size, adam_mult, matrix_mult):
 # ---------------------------------------------------------------
 # LR sweep configuration  (§4 & §6.3 of PLAN.md)
 #
-# Candidate grids for the 2 000-step calibration runs.
+# Candidate grids for the 200-step calibration runs.
 # For each (model_family, size), sweep these LRs and pick the
 # largest one whose grad norm stays stable.
 # ---------------------------------------------------------------

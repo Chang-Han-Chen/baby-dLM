@@ -138,10 +138,48 @@ Also reduced `LR_SWEEP_STEPS` from 2000 to 200 in `experiment_config.py`.
 
 ---
 
+## 2026-04-10: Efficiency Refactor (inspired by Karpathy's autoresearch train.py)
+
+Compared our training code against Karpathy's single-GPU autoresearch script to understand why his setup fits batch=128 at seq=2048 comfortably while ours OOMs at batch=32. Identified three key differences and applied them, plus cleaned up dead code.
+
+### Change 1: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+**train.py:3** — Set before any `torch.cuda` call. This was open question #2 from the previous section. Karpathy sets it at line 3 of his script. It tells PyTorch's caching allocator to use expandable memory segments instead of fixed-size blocks, which directly addresses the fragmentation issue observed in Issue E (allocator growing to 43 GiB while actual allocations were much smaller). Free improvement — no code changes, no performance cost.
+
+### Change 2: Flash Attention enablement + diagnostic logging
+**train.py:207-215** — Explicitly enables Flash SDP and memory-efficient SDP backends via `torch.backends.cuda`, then prints which backends are active at startup. This confirms that `F.scaled_dot_product_attention` dispatches to FA2 (O(N) memory for attention scores) rather than falling back to the "math" backend (O(N²) — the main memory hog identified in the analysis).
+
+Current status by model:
+- **AR** (`is_causal=True`, no explicit mask): FA2 should already be active. The diagnostic will confirm.
+- **MDLM** (`attn_mask=None` when `_is_single_block`): Also gets the efficient backend.
+- **BD3-LM** (explicit boolean block mask): Still falls back to math backend. Will need custom block-aware attention or mask conversion for FA2 compatibility — deferred until we actually run BD3-LM sweeps.
+
+### Change 3: GC management
+**train.py:706-713** — After step 0, runs `gc.collect()`, `gc.freeze()`, `gc.disable()`. Python's cyclic garbage collector causes ~500ms stalls when scanning the autograd graph. Karpathy does the same thing. Re-collects every 5000 steps as a safety valve. Impact: throughput improvement (fewer stalls), not memory.
+
+### Change 4: Legacy code removal in run_lr_sweep.py
+Deleted ~120 lines: `sweep_adamw()`, `sweep_normuon()`, `sweep_one_pair()`, and the `if False` dead branch. These legacy sequential-path functions were the root cause of Issue F (silently ignoring `--sweep-batch-size`). The parallel dispatcher `run_sweep_parallel()` with `max_workers=1` is now the single code path — functionally sequential but correctly respects all flags. Also removed an unused `avg` variable.
+
+### Expected impact
+- `expandable_segments` should reduce the 43 GiB steady-state peak (fragmentation was a significant contributor).
+- FA2 confirmation ensures we're not materializing O(N²) attention scores for AR and MDLM.
+- GC disable removes periodic ~500ms stalls.
+- Code is simpler: one dispatch path instead of two, ~120 fewer lines.
+
+### Open items
+- **Gradient checkpointing**: Still not implemented. Will likely be needed for 170M models at seq=2048.
+- **BD3-LM Flash Attention**: Block masks require the math SDPA backend. May need `torch.nn.attention.sdpa_kernel` workarounds or FlexAttention.
+- **FA3 via kernels package**: Karpathy uses `varunneal/flash-attention-3` (Hopper) or `kernels-community/flash-attn3` (non-Hopper). Could be a further improvement but adds a dependency.
+
+---
+
 ## Files Changed
 
 | File | Change |
 |------|--------|
+| `train.py:1-3` | Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before torch import |
+| `train.py:5` | Added `import gc` for GC management |
+| `train.py:207-215` | Enable Flash SDP + mem-efficient SDP, log SDPA backend status at startup |
+| `train.py:706-713` | GC management: collect/freeze/disable after step 0, re-collect every 5000 steps |
 | `train.py:691` | Log frequency: `iter % 100` → `iter % min(100, eval_interval)` |
 | `tests/test_cuda_smoke.py:88` | Default `min_steps` 5 → 3 |
 | `experiment_config.py:487` | `LR_SWEEP_STEPS` 2000 → 200 |
@@ -151,4 +189,4 @@ Also reduced `LR_SWEEP_STEPS` from 2000 to 200 in `experiment_config.py`.
 | `run_lr_sweep.py:218-221` | Added `_SWEEP_EFFECTIVE_BATCH = 256` constant |
 | `run_lr_sweep.py:162-177` | Updated VRAM estimates to empirical peaks |
 | `run_lr_sweep.py:309-316` | Sweep uses `use_compile=False`, computes `grad_accum_steps` from effective batch |
-| `run_lr_sweep.py:831-849` | Disabled legacy sequential path — always use parallel dispatcher |
+| `run_lr_sweep.py:602-767` | Deleted legacy `sweep_adamw()`, `sweep_normuon()`, `sweep_one_pair()`; single dispatch path via `run_sweep_parallel()` |

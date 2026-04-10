@@ -31,7 +31,7 @@ Smoke tests train directly on ClimbMix and skip automatically if `prepare.py` ha
 
 **Goal:** Find the best stable LR for each (optimizer, model, size) combination.
 
-Each sweep runs 2000-step warmup-stable training (5% linear warmup, then constant LR). The sweep script runs candidates in parallel, auto-detecting how many fit in VRAM, and early-aborts diverged runs.
+Each sweep currently runs 200-step warmup-stable training (5% linear warmup, then constant LR). The sweep script runs candidates in parallel, auto-detecting how many fit in VRAM, and early-aborts diverged runs.
 
 ### AdamW Sweeps (1D grid: 5 LRs per combo)
 
