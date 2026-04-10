@@ -123,6 +123,11 @@ def _normalize_mask_device(device) -> str:
 def make_bd3_train_block_mask(seq_len: int, block_len: int, device=None):
     """
     Sparse FlexAttention block mask for dual-stream BD3 training.
+
+    Intentionally uses FlexAttention's default sparse block size instead of
+    tying it to the logical BD3 token block_len. This matches the upstream
+    BD3LM usage and keeps the sparse-mask metadata much smaller for long
+    sequences (e.g. 4096 dual-stream tokens).
     """
     if not FLEX_ATTN_AVAILABLE:
         raise RuntimeError("FlexAttention is not available in this torch build")
@@ -134,7 +139,6 @@ def make_bd3_train_block_mask(seq_len: int, block_len: int, device=None):
         Q_LEN=2 * seq_len,
         KV_LEN=2 * seq_len,
         device=_normalize_mask_device(device),
-        BLOCK_SIZE=block_len,
     )
 
 
@@ -152,7 +156,6 @@ def make_block_causal_block_mask(seq_len: int, block_len: int, device=None):
         Q_LEN=seq_len,
         KV_LEN=seq_len,
         device=_normalize_mask_device(device),
-        BLOCK_SIZE=block_len,
     )
 
 
