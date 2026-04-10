@@ -523,3 +523,155 @@ Local verification completed:
 | `tests/test_bd3_masks.py` | Added tests for new sparse mask path |
 | `tests/test_block_diffusion.py` | Added regression coverage for the FlexAttention→SDPA fallback and forced-flex error propagation |
 | `MEMO.md` | Added this section |
+
+---
+
+## 2026-04-10: Curriculum 2 Script (NorMuon only)
+
+### Motivation
+
+Phase 1 covered C0 (plain AR→BD3(16)) and C1 (geometric doubling).
+Curriculum 2 is the "aggressive early jump" inspired by LLaDA 2: it ramps
+block_len quickly to very large values then narrows back down to 16 for the
+final stage. The hypothesis is that early exposure to large diffusion blocks
+accelerates learning of long-range dependencies, while the final narrow stage
+recovers generation quality at the target block_len.
+
+Per PLAN.md §3, the initial optimizer comparison covers only the baselines,
+C0, and C1. Later curricula are NorMuon-only until we understand whether the
+grouped optimizer recipe materially changes the ranking. C2 therefore runs
+with NorMuon exclusively.
+
+### Script: `run_phase1_c2.sh`
+
+**Usage:**
+```bash
+bash run_phase1_c2.sh
+```
+
+No arguments — optimizer is hardcoded to `normuon`.
+
+**Curriculum stages** (5 equal stages, 200 steps each, 1000 total):
+
+| Stage | Model | block_len | Steps | Resumes from |
+|-------|-------|-----------|-------|--------------|
+| 0 (AR warmup) | ar | — | 200 | scratch (shared warmup) |
+| 1 | bd3lm | 8 | 200 | `shared_normuon/ar_warmup/ckpt_step200.pt` |
+| 2 | bd3lm | 64 | 200 | `shared_normuon/c2/bd3_bl8/ckpt.pt` |
+| 3 | bd3lm | 512 | 200 | `shared_normuon/c2/bd3_bl64/ckpt.pt` |
+| 4 | bd3lm | 16 | 200 | `shared_normuon/c2/bd3_bl512/ckpt.pt` |
+
+**Output directory:** `runs/curriculum/shared_normuon/c2/`
+
+Each stage writes:
+- `bd3_bl{N}/ckpt.pt` — weights-only checkpoint (~250 MB)
+- `bd3_bl{N}/loss.pkl` — train loss / grad norm log (every 10 steps)
+
+### Design decisions
+
+1. **NorMuon only.** No `$1` argument, no AdamW branch. LR config is
+   hardcoded from calibration results (§4.1):
+   ```
+   --learning_rate 1.0 --min_lr 0.1
+   --adam_mult 0.3 --matrix_mult 1.0
+   --normuon_weight_decay 0.2
+   ```
+
+2. **Reuses shared AR warmup.** The AR stage is identical across C0, C1, and
+   C2 (warmup-stable schedule → path-independent weights at every step). The
+   script checks for `shared_normuon/ar_warmup/ckpt_step200.pt`. If it exists
+   (from a prior `run_phase1.sh normuon` run), the AR warmup is skipped
+   entirely. If not, the script runs the full 800-step AR warmup with
+   `--save_steps 200,300,500,800` so all curricula can branch from it.
+
+3. **Model size: 50M.** All stages use `--n_embd 768 --n_layer 7 --n_head 12`
+   (the canonical 50M config from PLAN.md §1).
+
+4. **Save weights only.** `--save_weights_only true` on every stage. This is
+   safe because stage transitions reset the optimizer and LR schedule — only
+   `model_state_dict` is needed for warm-start. Keeps disk usage to
+   ~4 × 250 MB = 1 GB for the four BD3 stages.
+
+5. **BD3 batch config.** All BD3 stages use `batch_size=32, grad_accum_steps=8`
+   (effective batch 256), matching the Phase 1 BD3 settings that were verified
+   to fit in A100-80GB VRAM.
+
+6. **Skip guards.** Every stage checks if its final checkpoint already exists
+   and skips if so. Safe to re-run after a crash — it picks up from the last
+   completed stage.
+
+7. **No in-run eval.** Same as Phase 1: `eval_interval=0`,
+   `skip_final_eval=true`, `num_final_samples=0`. Train loss / grad norm
+   logged every 10 steps for optimization traces; BPB eval can be done
+   post-hoc from saved checkpoints.
+
+### Potential issues to watch on VM
+
+1. **block_len=512 memory.** This is new territory — Phase 1 only went up to
+   block_len=16 (C0/baselines) and block_len=8 (C1 intermediate). With
+   seq_len=2048, block_len=512 means only 4 blocks per sequence. The attention
+   pattern is very different (each block attends over 512 tokens), which could
+   change memory behavior in the FlexAttention path. If stage 3 OOMs:
+   - First try: `BABYDLM_BD3_ATTN_BACKEND=sdpa` to force the dense SDPA path
+     (slower but more predictable memory)
+   - Second try: reduce to `batch_size=16, grad_accum_steps=16` (still
+     effective batch 256)
+
+2. **block_len=64 is also untested.** Same concern as above but less extreme
+   (32 blocks per sequence). Monitor grad_norm in the loss.pkl for any
+   instability.
+
+3. **FlexAttention + NorMuon.** The FlexAttention BD3 path was reported working
+   with NorMuon in the earlier memo section, but only at block_len=16. Larger
+   block_len values produce different block masks and could trigger different
+   Triton kernel paths. If you see `loss nan` / `grad_norm nan` at the start
+   of a stage, try forcing `BABYDLM_BD3_ATTN_BACKEND=sdpa`.
+
+4. **Numerical stability of the narrowing step (512→16).** Going from very
+   large blocks back to small blocks is the novel part of C2. The model has
+   spent 600 steps (stages 1–3) learning increasingly coarse diffusion
+   patterns. The final 200-step stage at block_len=16 asks it to suddenly
+   produce fine-grained predictions. Watch for loss spikes at the stage 4
+   transition — a warmup of 10 steps (5%) may not be enough. If loss diverges,
+   consider increasing `--warmup_iters` for stage 4 to 20 or 40.
+
+### Debugging checklist
+
+If a stage fails, check in order:
+
+1. **Which stage failed?** The skip guards mean the script restarts from the
+   last incomplete stage. Check which `ckpt.pt` files exist:
+   ```bash
+   ls -la runs/curriculum/shared_normuon/c2/*/ckpt.pt
+   ```
+
+2. **OOM?** Look for `CUDA out of memory` in stderr. Fix: reduce batch_size
+   or force SDPA backend (see point 1 above).
+
+3. **NaN loss?** Check the loss.pkl of the failed stage:
+   ```python
+   import pickle
+   with open("runs/curriculum/shared_normuon/c2/bd3_bl512/loss.pkl", "rb") as f:
+       data = pickle.load(f)
+   print(data)  # look for nan entries
+   ```
+   Fix: force SDPA backend, or increase warmup_iters.
+
+4. **AR warmup missing?** If the script errors on "file not found" for
+   `ckpt_step200.pt`, run the Phase 1 shared warmup first:
+   ```bash
+   bash run_phase1.sh normuon
+   ```
+   (it will produce all needed AR checkpoints then proceed to C0/C1 stages)
+
+5. **Wall time estimate.** Each BD3 stage at 50M/200 steps took ~6–8 min in
+   Phase 1 (block_len=16). Larger block_len may be faster (fewer blocks to
+   mask) or slower (larger attention windows). Expect ~30–50 min total for
+   the 4 BD3 stages.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `run_phase1_c2.sh` | New: Curriculum 2 runner — 5-stage LLaDA 2 style schedule, NorMuon only, 50M, 1000 steps |
+| `MEMO.md` | Added this section |
