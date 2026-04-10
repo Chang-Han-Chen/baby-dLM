@@ -54,6 +54,20 @@ def _resolve_bd3_attn_backend():
     return backend
 
 
+try:  # pragma: no cover - torch._dynamo internals vary by build
+    from torch._dynamo.exc import Unsupported as _DynamoUnsupported
+except Exception:  # pragma: no cover - depends on local torch build
+    _DynamoUnsupported = ()
+
+
+def _is_flex_attention_runtime_failure(exc: Exception) -> bool:
+    if _DynamoUnsupported and isinstance(exc, _DynamoUnsupported):
+        return True
+    msg = str(exc)
+    markers = ("flex_attention", "BlockMask", "Observed exception")
+    return any(marker in msg for marker in markers)
+
+
 if FLEX_ATTN_AVAILABLE:
     # Calling flex_attention directly outside torch.compile triggers an
     # unfused dense fallback that materializes the score matrix. Compile a
@@ -236,6 +250,7 @@ class DiffusionBackbone(nn.Module):
             self.register_buffer("train_attn_mask", None, persistent=False)
             self.register_buffer("sample_attn_mask", None, persistent=False)
         self._flex_mask_cache = {}
+        self._flex_fallback_reason = None
 
         self.blocks = nn.ModuleList(
             [Block(n_embd, n_head, head_dim, dropout) for _ in range(n_layer)]
@@ -305,8 +320,8 @@ class DiffusionBackbone(nn.Module):
             return self.train_attn_mask[:, :, :Tseq, :Tseq]
         return self.sample_attn_mask[:, :, :Tseq, :Tseq]
 
-    def _forward_core(self, idx, *, dual_stream=False):
-        """Run the transformer, return logits. No loss computation."""
+    def _forward_core_once(self, idx, *, dual_stream=False):
+        """Run one transformer pass, return logits. No loss computation."""
         B, Tseq = idx.size()
 
         x = self.token_emb(idx)
@@ -326,6 +341,32 @@ class DiffusionBackbone(nn.Module):
             logits = logits[:, : Tseq // 2]
 
         return logits
+
+    def _disable_flex_attention(self, exc: Exception) -> None:
+        self.bd3_attn_backend = "sdpa"
+        self._flex_mask_cache.clear()
+        if self._flex_fallback_reason is None:
+            self._flex_fallback_reason = f"{type(exc).__name__}: {exc}"
+            print(
+                "FlexAttention failed under "
+                f"BABYDLM_BD3_ATTN_BACKEND=auto ({self._flex_fallback_reason}). "
+                "Falling back to SDPA for the rest of this run."
+            )
+
+    def _forward_core(self, idx, *, dual_stream=False):
+        """Run the transformer, return logits. No loss computation."""
+        flex_attempted = self._should_use_flex_attention(idx.device)
+        try:
+            return self._forward_core_once(idx, dual_stream=dual_stream)
+        except Exception as exc:
+            if (
+                flex_attempted
+                and self.bd3_attn_backend == "auto"
+                and _is_flex_attention_runtime_failure(exc)
+            ):
+                self._disable_flex_attention(exc)
+                return self._forward_core_once(idx, dual_stream=dual_stream)
+            raise
 
     # ----- Public API -----
 

@@ -405,3 +405,121 @@ With `--save_weights_only true` on all checkpoints (~250 MB each):
 | `run_lr_sweep.py:162-177` | Updated VRAM estimates to empirical peaks |
 | `run_lr_sweep.py:309-316` | Sweep uses `use_compile=False`, computes `grad_accum_steps` from effective batch |
 | `run_lr_sweep.py:602-767` | Deleted legacy `sweep_adamw()`, `sweep_normuon()`, `sweep_one_pair()`; single dispatch path via `run_sweep_parallel()` |
+
+---
+
+## 2026-04-10: BD3-LM FlexAttention Integration
+
+### Motivation
+
+BD3-LM training remained much slower than AR / single-stream diffusion because
+explicit block masks forced the math SDPA path. On the A100-80GB, a 50M BD3-LM
+run still looked expensive even after fixing the micro-batch, so the next
+systems target was to move BD3 attention onto PyTorch FlexAttention.
+
+### Implementation
+
+Added a sparse BD3 mask path modeled after the upstream BD3-LM implementation:
+
+- `block_utils.py`
+  - factored the BD3 training and sampling mask rules into reusable
+    token-level `mask_mod` helpers
+  - added `make_bd3_train_block_mask()` and
+    `make_block_causal_block_mask()` using
+    `torch.nn.attention.flex_attention.create_block_mask()`
+- `backbone.py`
+  - added a compiled `fused_flex_attention()` wrapper around
+    `torch.nn.attention.flex_attention.flex_attention()`
+  - multi-block BD3-LM now uses FlexAttention automatically on CUDA when
+    available; dense SDPA remains the fallback path
+  - added `BABYDLM_BD3_ATTN_BACKEND=auto|sdpa|flex` to allow forcing either
+    implementation
+- `tests/test_bd3_masks.py`
+  - added coverage for the new `mask_mod` helpers and sparse block-mask
+    builders
+
+### Findings
+
+1. **Direct `flex_attention()` was not enough.**
+   Calling FlexAttention outside `torch.compile` triggered the documented
+   unfused dense fallback, which materialized the full score matrix and OOMed.
+   Wrapping the op in a tiny compiled helper was necessary to reach the fused
+   sparse Triton kernels.
+
+2. **FlexAttention appears faster, but not dramatically leaner.**
+   On the VM, the fused Triton kernels were generated and BD3-LM looked faster.
+   However, peak memory did not drop much. This suggests attention-score
+   materialization was only part of the BD3-LM memory cost; dual-stream
+   activations, MLP activations, logits, and backward state still dominate a
+   large fraction of VRAM.
+
+3. **A forced kernel-options tuning attempt was unstable.**
+   A short experiment that forced custom FlexAttention `kernel_options`
+   (including `ROWS_GUARANTEED_SAFE=True` and fixed backward tile settings)
+   produced `loss nan` / `grad_norm nan` at step 0. Those custom options were
+   reverted. The current code uses the simpler compiled wrapper with default
+   FlexAttention kernel selection.
+
+4. **Optimizer-family behavior diverged.**
+   - **NorMuon**: the FlexAttention BD3 path appears to run.
+   - **AdamW**: hit `torch._dynamo.exc.Unsupported: Observed exception`
+     originating from the compiled FlexAttention wrapper.
+
+### Current mitigation
+
+The tiny compiled FlexAttention wrapper in `backbone.py` remains the preferred
+fast path, but the BD3 backbone now has an **automatic runtime fallback**:
+
+- when `BABYDLM_BD3_ATTN_BACKEND=auto`, if the compiled FlexAttention path
+  throws the observed Dynamo / Flex-style runtime failure, the model logs the
+  exception once, flips itself to dense SDPA, clears the Flex block-mask cache,
+  and retries the forward pass instead of crashing the run
+- when `BABYDLM_BD3_ATTN_BACKEND=flex` is explicitly forced, the exception is
+  still raised normally so real Flex regressions are not silently hidden
+
+This mitigation was implemented locally on **2026-04-10** after reading the
+existing note and tracing the BD3 attention path. It is intended to keep AdamW
+training moving even if the compiled FlexAttention wrapper remains unstable on
+the VM.
+
+What is still unknown:
+
+- this workspace has **no CUDA device**, so the original AdamW-only failure
+  could not be reproduced directly here
+- we therefore have a robust fallback path, but **not yet a confirmed root
+  cause** for why AdamW trips the Flex path while NorMuon appears to survive it
+
+Practical takeaway:
+
+- Keep the FlexAttention path as the main candidate for BD3 speedups.
+- Treat the memory result as "faster but not fundamentally cheaper."
+- Prefer `BABYDLM_BD3_ATTN_BACKEND=auto` so AdamW can opportunistically use
+  FlexAttention but fall back to SDPA automatically if the wrapper fails.
+- If we need deterministic behavior for measurement or debugging, force
+  `BABYDLM_BD3_ATTN_BACKEND=sdpa` for AdamW while continuing to use FlexAttention
+  for NorMuon / systems measurements.
+
+### Follow-up verification
+
+Added CPU-side regression coverage for the new behavior:
+
+- `tests/test_block_diffusion.py`
+  - simulates a FlexAttention failure and verifies that `auto` mode retries
+    with SDPA and only attempts the failing Flex path once
+  - verifies that forced `flex` mode still surfaces the exception
+  - fixes an unrelated stale assertion to match the actual
+    `forward_train(..., targets=...) -> (None, loss)` API
+
+Local verification completed:
+
+- `pytest tests/test_block_diffusion.py -q` → **54 passed**
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `block_utils.py` | Added BD3 `mask_mod` helpers + FlexAttention block-mask builders |
+| `backbone.py` | Added compiled `fused_flex_attention()` wrapper; auto-select FlexAttention for CUDA BD3-LM; env override via `BABYDLM_BD3_ATTN_BACKEND`; automatic fallback from FlexAttention to SDPA in `auto` mode |
+| `tests/test_bd3_masks.py` | Added tests for new sparse mask path |
+| `tests/test_block_diffusion.py` | Added regression coverage for the FlexAttention→SDPA fallback and forced-flex error propagation |
+| `MEMO.md` | Added this section |

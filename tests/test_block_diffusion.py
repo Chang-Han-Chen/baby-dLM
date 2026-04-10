@@ -12,6 +12,7 @@ import math
 import pytest
 import torch
 
+import backbone
 from backbone import DiffusionBackbone
 from block_utils import (
     bd3_train_mask_special_cases_ok,
@@ -346,6 +347,82 @@ class TestBackboneMultiBlock:
         # Block 0 logits should be identical regardless of later blocks
         assert torch.allclose(logits_orig[:, :BLOCK_LEN], logits_alt[:, :BLOCK_LEN], atol=1e-5)
 
+    def test_auto_backend_falls_back_to_sdpa_after_flex_failure(
+        self, multi_block_model, monkeypatch
+    ):
+        class FakeBlockMask:
+            pass
+
+        calls = {"count": 0}
+
+        def fail_flex(q, k, v, attn_mask):
+            calls["count"] += 1
+            raise RuntimeError("flex_attention failed inside compiled wrapper")
+
+        monkeypatch.setattr(backbone, "FLEX_ATTN_AVAILABLE", True)
+        monkeypatch.setattr(backbone, "BlockMask", FakeBlockMask)
+        monkeypatch.setattr(backbone, "fused_flex_attention", fail_flex)
+        monkeypatch.setattr(
+            DiffusionBackbone,
+            "_should_use_flex_attention",
+            lambda self, device: self.bd3_attn_backend != "sdpa",
+        )
+        monkeypatch.setattr(
+            DiffusionBackbone,
+            "_get_flex_attn_mask",
+            lambda self, Tseq, dual_stream, device: FakeBlockMask(),
+        )
+
+        multi_block_model.eval()
+        multi_block_model.bd3_attn_backend = "auto"
+        xt = torch.randint(0, VOCAB_SIZE, (2, BLOCK_SIZE))
+        x0 = torch.randint(0, VOCAB_SIZE, (2, BLOCK_SIZE))
+
+        with torch.no_grad():
+            logits, _ = multi_block_model.forward_train(xt, x0)
+            logits_2, _ = multi_block_model.forward_train(xt, x0)
+
+        assert logits.shape == (2, BLOCK_SIZE, VOCAB_SIZE)
+        assert torch.equal(logits, logits_2)
+        assert multi_block_model.bd3_attn_backend == "sdpa"
+        assert "flex_attention failed" in multi_block_model._flex_fallback_reason
+        assert calls["count"] == 1
+
+    def test_forced_flex_backend_does_not_swallow_flex_failure(
+        self, multi_block_model, monkeypatch
+    ):
+        class FakeBlockMask:
+            pass
+
+        def fail_flex(q, k, v, attn_mask):
+            raise RuntimeError("flex_attention failed inside compiled wrapper")
+
+        monkeypatch.setattr(backbone, "FLEX_ATTN_AVAILABLE", True)
+        monkeypatch.setattr(backbone, "BlockMask", FakeBlockMask)
+        monkeypatch.setattr(backbone, "fused_flex_attention", fail_flex)
+        monkeypatch.setattr(
+            DiffusionBackbone,
+            "_should_use_flex_attention",
+            lambda self, device: self.bd3_attn_backend != "sdpa",
+        )
+        monkeypatch.setattr(
+            DiffusionBackbone,
+            "_get_flex_attn_mask",
+            lambda self, Tseq, dual_stream, device: FakeBlockMask(),
+        )
+
+        multi_block_model.eval()
+        multi_block_model.bd3_attn_backend = "flex"
+        xt = torch.randint(0, VOCAB_SIZE, (1, BLOCK_SIZE))
+        x0 = torch.randint(0, VOCAB_SIZE, (1, BLOCK_SIZE))
+
+        with pytest.raises(RuntimeError, match="flex_attention failed"):
+            with torch.no_grad():
+                multi_block_model.forward_train(xt, x0)
+
+        assert multi_block_model.bd3_attn_backend == "flex"
+        assert multi_block_model._flex_fallback_reason is None
+
 
 class TestBackboneRotary:
     def test_dual_stream_rotary_length(self, multi_block_model):
@@ -529,5 +606,5 @@ class TestBlockLenVariations:
         x0 = torch.randint(0, VOCAB_SIZE, (2, BLOCK_SIZE))
         mask = torch.rand(2, BLOCK_SIZE) > 0.5
         logits, loss = model.forward_train(xt, x0, targets=x0, supervise_mask=mask)
-        assert logits.shape == (2, BLOCK_SIZE, VOCAB_SIZE)
+        assert logits is None
         assert loss is not None
