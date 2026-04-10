@@ -829,24 +829,10 @@ def main():
         print(f"  {k}: {n} runs")
 
     # ---- Execute ----
-    if max_workers <= 1 and not args.dry_run:
-        # Sequential mode: use the legacy per-group interface for cleaner output
-        print("\n[Sequential mode]")
-        adamw_results = {}
-        normuon_results = {}
-        for opt in optimizers:
-            for model in models:
-                for size in sizes:
-                    if opt == "adamw":
-                        chosen = sweep_adamw(model, size, args.out_root,
-                                             dry_run=args.dry_run)
-                        if chosen is not None:
-                            adamw_results[(model, size)] = chosen
-                    elif opt == "normuon":
-                        chosen = sweep_normuon(model, size, args.out_root,
-                                               dry_run=args.dry_run)
-                        if chosen is not None:
-                            normuon_results[(model, size)] = chosen
+    if False:
+        # Legacy sequential mode disabled — the parallel dispatcher handles
+        # max_workers=1 correctly and respects --sweep-batch-size.
+        pass
     else:
         # Parallel mode
         t_start = time.time()

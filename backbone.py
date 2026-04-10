@@ -249,23 +249,24 @@ class DiffusionBackbone(nn.Module):
         """
         logits = self._forward_core(idx, dual_stream=False)
 
-        loss = None
-        if targets is not None:
-            sup = mask if mask is not None else supervise_mask
-            if sup is None:
-                raise ValueError(
-                    "mask or supervise_mask must be provided when targets is provided"
-                )
-            B, T2, V = logits.shape
-            per_token_loss = F.cross_entropy(
-                logits.reshape(B * T2, V),
-                targets.reshape(B * T2),
-                reduction="none",
-            ).reshape(B, T2)
-            sup_f = sup.float()
-            loss = (per_token_loss * sup_f).sum() / sup_f.sum().clamp_min(1.0)
+        if targets is None:
+            return logits, None
 
-        return logits, loss
+        sup = mask if mask is not None else supervise_mask
+        if sup is None:
+            raise ValueError(
+                "mask or supervise_mask must be provided when targets is provided"
+            )
+        B, T2, V = logits.shape
+        per_token_loss = F.cross_entropy(
+            logits.reshape(B * T2, V),
+            targets.reshape(B * T2),
+            reduction="none",
+        ).reshape(B, T2)
+        sup_f = sup.float()
+        loss = (per_token_loss * sup_f).sum() / sup_f.sum().clamp_min(1.0)
+
+        return None, loss
 
     def forward_train(self, xt, x0, targets=None, supervise_mask=None):
         """Dual-stream forward for block-diffusion training.
@@ -282,40 +283,42 @@ class DiffusionBackbone(nn.Module):
             x_input = torch.cat([xt, x0], dim=1)
             logits = self._forward_core(x_input, dual_stream=True)
 
-        loss = None
-        if targets is not None:
-            if supervise_mask is None:
-                raise ValueError(
-                    "supervise_mask must be provided when targets is provided"
-                )
-            B, T2, V = logits.shape
-            per_token_loss = F.cross_entropy(
-                logits.reshape(B * T2, V),
-                targets.reshape(B * T2),
-                reduction="none",
-            ).reshape(B, T2)
-            sup_f = supervise_mask.float()
-            loss = (per_token_loss * sup_f).sum() / sup_f.sum().clamp_min(1.0)
+        if targets is None:
+            return logits, None
 
-        return logits, loss
+        if supervise_mask is None:
+            raise ValueError(
+                "supervise_mask must be provided when targets is provided"
+            )
+        B, T2, V = logits.shape
+        per_token_loss = F.cross_entropy(
+            logits.reshape(B * T2, V),
+            targets.reshape(B * T2),
+            reduction="none",
+        ).reshape(B, T2)
+        sup_f = supervise_mask.float()
+        loss = (per_token_loss * sup_f).sum() / sup_f.sum().clamp_min(1.0)
+
+        return None, loss
 
     def forward_sample(self, idx, targets=None, supervise_mask=None):
         """Single-stream forward with block-causal mask for generation."""
         logits = self._forward_core(idx, dual_stream=False)
 
-        loss = None
-        if targets is not None:
-            if supervise_mask is None:
-                raise ValueError(
-                    "supervise_mask must be provided when targets is provided"
-                )
-            B, T2, V = logits.shape
-            per_token_loss = F.cross_entropy(
-                logits.reshape(B * T2, V),
-                targets.reshape(B * T2),
-                reduction="none",
-            ).reshape(B, T2)
-            sup_f = supervise_mask.float()
-            loss = (per_token_loss * sup_f).sum() / sup_f.sum().clamp_min(1.0)
+        if targets is None:
+            return logits, None
 
-        return logits, loss
+        if supervise_mask is None:
+            raise ValueError(
+                "supervise_mask must be provided when targets is provided"
+            )
+        B, T2, V = logits.shape
+        per_token_loss = F.cross_entropy(
+            logits.reshape(B * T2, V),
+            targets.reshape(B * T2),
+            reduction="none",
+        ).reshape(B, T2)
+        sup_f = supervise_mask.float()
+        loss = (per_token_loss * sup_f).sum() / sup_f.sum().clamp_min(1.0)
+
+        return None, loss

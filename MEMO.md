@@ -80,7 +80,20 @@ This means a single 50M model at batch=32 eventually consumes **53% of an A100-8
 
 **Current status:** Auto-detect now selects `--jobs 1` (sequential). All 5 LR candidates run one at a time.
 
-**Open questions for investigation:**
+### Root cause found: unnecessary logit tensor retention
+
+**model_AR.py:166-176** — `forward()` always computes and returns the full `logits` tensor `(B, T, V)` even during training when only the loss scalar is needed. This tensor is `(32, 2048, 8192)` in bf16 = 1 GiB (or 2 GiB in fp32 after cross_entropy upcast), and it stays alive in the autograd graph because it's returned from forward().
+
+Profiling with `torch.cuda.memory_allocated()`:
+- Model params: 0.23 GB (fp32)
+- **After forward (batch=32):** 37.35 GB allocated, 37.48 GB peak
+- This is ~160× the model size, for a single forward pass
+
+The logits are never used in training (`compute_loss` discards them: `_, loss = model(x, targets=targets)`), but Python holds the reference until the tuple is destructured, and autograd saves intermediates for the backward pass through the logits path.
+
+**Potential fix:** When `targets` is provided, don't return logits (or compute loss in-place without materializing the full logits tensor, e.g., use chunked cross-entropy).
+
+**Open questions for further investigation:**
 1. **Why does a 50M model need 43 GiB at batch=32?** Model params are ~59M × 4 bytes × 3 (params + grads + optimizer) ≈ 0.7 GiB. Activations for batch=32, seq=2048, 16 layers shouldn't be this large. Is something being retained unnecessarily?
 2. **Would `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` help?** The OOM errors mention fragmentation. This env var was added in PyTorch 2.1+ to reduce it.
 3. **Is gradient checkpointing an option?** Could dramatically reduce activation memory at the cost of recomputation, enabling parallelism.
@@ -95,14 +108,33 @@ This means a single 50M model at batch=32 eventually consumes **53% of an A100-8
 | v2 | batch=128, compile=on | 4 (auto) | All 5 OOM — compile spike to 55 GiB |
 | v3 | batch=128, compile=off | 8 (auto) | All 5 OOM — each process peaks at 22-57 GiB |
 | v4 | batch=32, accum=8, compile=off | 6 (auto) | All 5 OOM — 5 procs × 8 GiB init = 42 GiB, then growth |
-| v5 | batch=32, accum=8, compile=off | 2 (auto) | 4/5 OOM — proc 1 grew to 42 GiB, starving proc 2. LR=1e-4 survived (still running) |
-| v6 (planned) | batch=32, accum=8, compile=off | 1 (sequential) | Not yet run |
+| v5 | batch=32, accum=8, compile=off | 2 (auto) | 4/5 OOM — proc 1 grew to 42 GiB, starving proc 2 |
+| v6 | batch=32, accum=8, compile=off | 1 (sequential) | All 5 OOM @ 78 GiB — **sequential path ignored `--sweep-batch-size`, ran at batch=128** |
+| v7 | batch=32, accum=8, compile=off, 200 steps | 1 (parallel dispatcher) | **Running successfully** — 52% VRAM (43 GiB), 100% util |
 
-### Current sweep configuration
+#### Issue F: Sequential code path ignored `--sweep-batch-size`
+When `max_workers <= 1`, the sweep used a legacy `sweep_adamw()` function that called `run_single()` without passing the `batch_size` override. So `--sweep-batch-size 32` was silently ignored and jobs ran at the default batch=128 (~78 GiB per process), causing every sequential run to OOM.
+
+**Fix:** Disabled the legacy sequential code path. All runs now go through `run_sweep_parallel()` which correctly passes `batch_size` to `run_single()`. With max_workers=1 this is functionally sequential but respects all flags.
+
+#### Issue G: Logit tensor retention in forward()
+`model_AR.py`, `backbone.py` — all `forward()` methods returned the full `(B, T, V)` logits tensor even during training, where only the loss scalar is needed. Training discards it (`_, loss = model(...)`) but it stays alive in the autograd graph.
+
+Profiled with `torch.cuda.memory_allocated()`: peak after forward at batch=32 is ~42 GiB regardless (dominated by saved activations for 16 transformer layers), so this is a modest improvement. But it avoids holding a ~1-2 GiB tensor across the forward→backward boundary.
+
+**Fix:** When `targets` is provided, `forward()` now returns `(None, loss)` instead of `(logits, loss)`. Inference path (`targets=None`) still returns logits as before.
+
+### Reduced sweep strategy
+200 steps was enough to rank LR candidates. Plan: pick top 2, then run 1000 steps on those two for a confident final pick.
+
+Also reduced `LR_SWEEP_STEPS` from 2000 to 200 in `experiment_config.py`.
+
+### Current sweep configuration (working)
 - `--sweep-batch-size 32`, `grad_accum_steps=8`, effective batch = 256
 - `--use_compile false`
-- `--jobs 1` (sequential) — only safe option given memory behavior
-- 5 LR candidates run one at a time, ~15-20 min each
+- `--max_iters 200`, warmup = 10 steps (5%)
+- 1 worker via parallel dispatcher (sequential execution, respects all flags)
+- Peak VRAM: ~43 GiB per process on A100-80GB
 
 ---
 
@@ -112,8 +144,11 @@ This means a single 50M model at batch=32 eventually consumes **53% of an A100-8
 |------|--------|
 | `train.py:691` | Log frequency: `iter % 100` → `iter % min(100, eval_interval)` |
 | `tests/test_cuda_smoke.py:88` | Default `min_steps` 5 → 3 |
+| `experiment_config.py:487` | `LR_SWEEP_STEPS` 2000 → 200 |
 | `experiment_config.py:533,633` | Added `use_compile` param to `build_command()`, appends `--use_compile` to cmd |
+| `model_AR.py:166-176` | Return `(None, loss)` during training to avoid retaining logits tensor |
+| `backbone.py:250-268,270-300,302-321` | Same logit fix for `forward()`, `forward_train()`, `forward_sample()` |
 | `run_lr_sweep.py:218-221` | Added `_SWEEP_EFFECTIVE_BATCH = 256` constant |
-| `run_lr_sweep.py:162-177` | Updated VRAM estimates to empirical batch=128 peaks |
-| `run_lr_sweep.py:204-207` | Fixed VRAM scaling formula: 10% fixed + 90% scales |
+| `run_lr_sweep.py:162-177` | Updated VRAM estimates to empirical peaks |
 | `run_lr_sweep.py:309-316` | Sweep uses `use_compile=False`, computes `grad_accum_steps` from effective batch |
+| `run_lr_sweep.py:831-849` | Disabled legacy sequential path — always use parallel dispatcher |

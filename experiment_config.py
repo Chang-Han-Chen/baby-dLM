@@ -484,7 +484,7 @@ LR_SWEEP_GRIDS = {
     "bd3lm": LR_SWEEP_GRID_DEFAULT,
 }
 
-LR_SWEEP_STEPS = 2000
+LR_SWEEP_STEPS = 200
 LR_SWEEP_WARMUP_FRAC = 0.05   # 5% linear warmup, then constant
 
 # NorMuon 2D sweep grid (§4 of PLAN.md)

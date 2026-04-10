@@ -165,15 +165,17 @@ class Model(nn.Module):
         x = norm(x)
         logits = self.lm_head(x)
 
-        loss = None
-        if targets is not None:
-            # Standard next-token CE: logits[:, :-1] predicts targets[:, 1:]
-            loss = F.cross_entropy(
-                logits[:, :-1].reshape(-1, self.vocab_size),
-                targets[:, 1:].reshape(-1),
-            )
+        if targets is None:
+            return logits, None
 
-        return logits, loss
+        # Standard next-token CE: logits[:, :-1] predicts targets[:, 1:]
+        loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, self.vocab_size),
+            targets[:, 1:].reshape(-1),
+        )
+        # Don't return logits during training — the (B, T, V) tensor is
+        # never used by compute_loss and retaining it wastes massive VRAM.
+        return None, loss
 
 
 # ------------------------------------------------------------------
