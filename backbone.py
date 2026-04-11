@@ -73,7 +73,7 @@ if FLEX_ATTN_AVAILABLE:
     # unfused dense fallback that materializes the score matrix. Compile a
     # tiny wrapper so BD3 gets the intended sparse fused kernel path without
     # requiring the whole model to be compiled.
-    @torch.compile(mode="max-autotune-no-cudagraphs")
+    @torch.compile(mode="default")
     def fused_flex_attention(q, k, v, block_mask):
         return flex_attention(q, k, v, block_mask=block_mask)
 else:  # pragma: no cover - depends on local torch build
